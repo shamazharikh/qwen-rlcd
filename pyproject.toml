@@ -1,0 +1,12 @@
+[project]
+name = "system-one"
+version = "0.0.1"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.5", "transformers>=5.17", "accelerate"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
