@@ -1,7 +1,8 @@
 """M0: prefix-fork reads must match independent full forward passes (PLAN.md §2).
 
 Fast tests use a tiny randomly initialised Qwen3.5 hybrid text model. The real-weights test runs
-`Qwen/Qwen3.5-0.8B-Base` and is enabled with `QWEN_RLCD_SLOW=1`.
+`Qwen/Qwen3.5-0.8B-Base` and is enabled with `QWEN_RLCD_SLOW=1`. Tests run on CUDA when available,
+which exercises the fla / causal-conv1d kernels if they are installed.
 """
 
 import os
@@ -21,6 +22,7 @@ TOL = 1e-3  # PLAN.md acceptance threshold for real weights (fp32)
 TINY_TOL = 1e-5
 CONV_KERNEL = 4
 PAD_ID = 0
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +43,7 @@ def tiny_model():
         linear_value_head_dim=16,
         linear_conv_kernel_dim=CONV_KERNEL,
     )
-    return Qwen3_5TextModel(config).eval().float()
+    return Qwen3_5TextModel(config).eval().float().to(DEVICE)
 
 
 def _rand_ids(n, vocab=512):
@@ -49,7 +51,7 @@ def _rand_ids(n, vocab=512):
 
 
 def assert_fork_matches(model, state, branches, tol=TINY_TOL):
-    state_ids = torch.tensor([state])
+    state_ids = torch.tensor([state], device=DEVICE)
     with torch.no_grad():
         forked = fork_forward(model, state_ids, branches, PAD_ID)
         reference = sequential_reads(model, state_ids, branches)
@@ -75,7 +77,7 @@ def test_fork_matches_sequential(tiny_model, state_len, branch_lens):
 def test_read_independent_of_padding_and_siblings(tiny_model):
     random.seed(1)
     state, target = _rand_ids(30), _rand_ids(6)
-    state_ids = torch.tensor([state])
+    state_ids = torch.tensor([state], device=DEVICE)
     with torch.no_grad():
         alone = fork_forward(tiny_model, state_ids, [target], PAD_ID)[0]
         for extra in (7, 50):  # the sibling forces target to be right-padded by `extra` tokens
@@ -85,7 +87,7 @@ def test_read_independent_of_padding_and_siblings(tiny_model):
 
 def test_expand_cache_forks_recurrent_state_and_leaves_source_intact(tiny_model):
     random.seed(2)
-    state_ids = torch.tensor([_rand_ids(12)])
+    state_ids = torch.tensor([_rand_ids(12)], device=DEVICE)
     branches = [_rand_ids(4), _rand_ids(8)]
     with torch.no_grad():
         cache = prefill_state(tiny_model, state_ids)
@@ -119,11 +121,17 @@ def test_detects_unforked_linear_attention_state(tiny_model, monkeypatch, states
         assert_fork_matches(tiny_model, state, branches)
 
 
+REAL_DTYPES = [torch.float32]
+if DEVICE == "cuda" and torch.cuda.get_device_capability()[0] >= 8:
+    REAL_DTYPES.append(torch.bfloat16)
+
+
 @pytest.mark.skipif(os.environ.get("QWEN_RLCD_SLOW") != "1", reason="set QWEN_RLCD_SLOW=1 to run real weights")
-def test_fork_matches_sequential_qwen35_08b_base():
+@pytest.mark.parametrize("dtype", REAL_DTYPES, ids=str)
+def test_fork_matches_sequential_qwen35_08b_base(dtype):
     repo = "Qwen/Qwen3.5-0.8B-Base"
     tok = AutoTokenizer.from_pretrained(repo)
-    model = AutoModelForImageTextToText.from_pretrained(repo, dtype=torch.float32).eval()
+    model = AutoModelForImageTextToText.from_pretrained(repo, dtype=dtype).eval().to(DEVICE)
     text_model = model.model.language_model
 
     state = tok("<state>\nOur API started returning 500s 20 minutes ago; we can't process orders.\n</state>\n").input_ids
@@ -137,10 +145,14 @@ def test_fork_matches_sequential_qwen35_08b_base():
     branches.append(tok("Question: The message conveys urgency.\nAnswer (yes/no):").input_ids)
 
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    state_ids = torch.tensor([state])
+    state_ids = torch.tensor([state], device=DEVICE)
     with torch.no_grad():
-        forked = fork_forward(text_model, state_ids, branches, pad_id)
-        reference = sequential_reads(text_model, state_ids, branches)
+        forked = fork_forward(text_model, state_ids, branches, pad_id).float()
+        reference = sequential_reads(text_model, state_ids, branches).float()
     diff = (forked - reference).abs().max().item()
-    print(f"\nQwen3.5-0.8B-Base fork vs sequential: max abs diff {diff:.2e} over {len(branches)} branches")
-    assert diff < TOL
+    cos = torch.nn.functional.cosine_similarity(forked, reference, dim=-1).min().item()
+    print(f"\nQwen3.5-0.8B-Base [{DEVICE}, {dtype}] fork vs sequential: max abs diff {diff:.2e}, min cos {cos:.6f}")
+    if dtype == torch.float32:
+        assert diff < TOL
+    else:  # bf16: kernels pick different chunkings for different shapes, so compare direction only
+        assert cos > 0.9999

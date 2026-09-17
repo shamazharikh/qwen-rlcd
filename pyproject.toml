@@ -7,6 +7,13 @@ dependencies = ["torch>=2.5", "transformers>=5.17", "accelerate"]
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["system_one"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

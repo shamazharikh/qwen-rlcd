@@ -6,3 +6,5 @@ checkpoints/
 runs/
 wandb/
 *.safetensors
+.claude/
+*.egg-info/
