@@ -52,7 +52,7 @@ uv venv --python 3.12 .venv && uv pip install -e '.[dev]'
 QWEN_RLCD_SLOW=1 .venv/bin/python -m pytest -q -s -k qwen35     # real Qwen3.5-0.8B-Base weights
 .venv/bin/python scripts/bench_fork.py                           # benchmark (use a CUDA GPU)
 ```
-GPU: [open the notebook in Colab](https://colab.research.google.com/github/shamazharikh/qwen-rlcd/blob/worktree-m0-gpu-checks/notebooks/m0_gpu_checks.ipynb), choose a GPU runtime, and click Run all. The notebook clones the `worktree-m0-gpu-checks` branch; update its clone cell once that branch is merged.
+GPU: [open the notebook in Colab](https://colab.research.google.com/github/shamazharikh/qwen-rlcd/blob/main/notebooks/m0_gpu_checks.ipynb), choose a GPU runtime, and click Run all.
 
 ---
 
