@@ -6,6 +6,56 @@ A prototype of a "System One" decision model, inspired by TypeSafe AI's **Jev**.
 
 ---
 
+## Project status (2026-09-17)
+
+The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md) for milestones. Current scope is **inference only**; training and fine-tuning (PLAN.md M2) are on hold.
+
+### Key design change: prefix-fork instead of a tree mask
+Qwen3.5-0.8B is a hybrid model: 24 layers = **18 Gated DeltaNet (linear attention) + 6 gated full attention**. A tree attention mask (§2.2, §5.4 below) cannot isolate sibling branches inside recurrent layers, so this repo uses **prefix-fork execution** instead:
+
+1. Prefill the state once and keep its cache (KV for attention layers, conv + recurrent state for DeltaNet layers).
+2. Copy that cache along the batch dimension, one row per branch.
+3. Run every `question + answer` branch as one right-padded batch at the same position offset, and read the hidden state at each branch's last real token.
+
+Branches are isolated in every layer type by construction, and results can't depend on question or option order.
+
+### What's built (M0)
+| Path | What it does |
+|---|---|
+| `system_one/fork.py` | `prefill_state`, `expand_cache`, `forward_branches`, `fork_forward`, plus a `sequential_reads` reference (one uncached full forward per branch) |
+| `tests/test_fork_equivalence.py` | Fork vs. sequential equivalence on a tiny random hybrid model and on real 0.8B weights; covers padding and sibling independence, conv-kernel and delta-rule chunk edge cases, source-cache immutability, and sensitivity checks that must fail when DeltaNet state isn't forked. Runs on CUDA when available. |
+| `scripts/bench_fork.py` | Latency and peak memory: fork vs. one forward per branch, across state lengths and branch counts |
+| `notebooks/m0_gpu_checks.ipynb` | Colab notebook: installs `flash-linear-attention`, runs the tests on GPU, then the benchmark |
+
+### Results so far (Mac CPU, fp32, torch fallback kernels)
+| Check | Max abs diff |
+|---|---|
+| Tiny model, fork vs. sequential | ~7e-7 (tolerance 1e-5) |
+| **Qwen3.5-0.8B-Base, fork vs. sequential** | **4.8e-5** (tolerance 1e-3) |
+| 0.8B with forked recurrent state zeroed (negative control) | 6.3 |
+| 0.8B with forked conv state zeroed (negative control) | 3.1 |
+
+### Findings
+- **`DynamicCache.batch_repeat_interleave` can't fork this model** (transformers 5.17). `LinearAttentionLayer` has no such method, and `LinearAttentionAndFullAttentionLayer` inherits `DynamicLayer`'s, which repeats only keys and values. Hence the custom `expand_cache`.
+- **The cache updates DeltaNet state in place** (`copy_`), so backward through a forked cache fails. This only matters for training, which is out of scope for now.
+- **Tiny random models barely use DeltaNet state.** Zeroing it moves reads by only ~1e-4, so tiny-model tests use a 1e-5 tolerance to stay sensitive.
+- **Colab (T4):** compiling `causal-conv1d` ran the VM out of memory and killed the runtime twice, so the notebook now installs only `flash-linear-attention`. A third attempt couldn't connect to a runtime at all.
+
+### Open items
+- [ ] Run `notebooks/m0_gpu_checks.ipynb` on a GPU (Colab retry, Kaggle, or RunPod): fork equivalence with the fla kernel and the fork-vs-sequential benchmark
+- [ ] M1: templates with the option list in the branch, a `<|read|>` token, Choice/Score/Noul heads, a typed inference API, and zero-shot baselines
+
+### Quickstart
+```bash
+uv venv --python 3.12 .venv && uv pip install -e '.[dev]'
+.venv/bin/python -m pytest -q                                   # fast tests (tiny model)
+QWEN_RLCD_SLOW=1 .venv/bin/python -m pytest -q -s -k qwen35     # real Qwen3.5-0.8B-Base weights
+.venv/bin/python scripts/bench_fork.py                           # benchmark (use a CUDA GPU)
+```
+GPU: [open the notebook in Colab](https://colab.research.google.com/github/shamazharikh/qwen-rlcd/blob/worktree-m0-gpu-checks/notebooks/m0_gpu_checks.ipynb), choose a GPU runtime, and click Run all. The notebook clones the `worktree-m0-gpu-checks` branch; update its clone cell once that branch is merged.
+
+---
+
 ## 1. Public facts about Jev (TypeSafe AI)
 
 - It is a non-chat decision model. It returns typed answers and probabilities, not generated text.
