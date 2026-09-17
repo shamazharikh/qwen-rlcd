@@ -6,3 +6,4 @@ checkpoints/
 runs/
 wandb/
 *.safetensors
+.claude/
