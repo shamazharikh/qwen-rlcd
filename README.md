@@ -85,6 +85,28 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | `tests/test_predict.py` | Schema validation, rendering independent of option order, answer well-formedness, **question/option-order invariance and fan-out = single-question answers for every scorer** (< 1e-5), fork likelihood = unforked likelihood, PMI arithmetic, `<|read|>` fits in the embedding |
 | `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge (choice), BoolQ (noul), SST-5 (score) |
 
+Zero-shot baselines (`scripts/zero_shot_eval.py --device cpu --limit 100`, Qwen3.5-0.8B-Base fp32, seed 0; 95% CI on accuracy ≈ ±0.09 at n = 100):
+
+| dataset (type, K) | scorer | acc | NLL | Brier | ECE-15 | MAE |
+|---|---|---|---|---|---|---|
+| ARC-Challenge (choice, 4–5) | **letter** | **0.60** | **0.92** | **0.50** | 0.16 | – |
+| | sum | 0.32 | 4.01 | 1.12 | 0.47 | – |
+| | mean | 0.40 | 1.38 | 0.74 | 0.11 | – |
+| | sum-pmi | 0.49 | 2.15 | 0.81 | 0.31 | – |
+| | mean-pmi | 0.49 | 1.30 | 0.71 | 0.16 | – |
+| BoolQ (noul) | letter (yes/no logits) | 0.77 | 0.55 | 0.37 | 0.12 | – |
+| | sum / mean | 0.75 | 0.55 | 0.37 | 0.11 | – |
+| | **sum-pmi / mean-pmi** | **0.79** | **0.54** | **0.36** | 0.13 | – |
+| SST-5 (score, 5) | letter | 0.23 | 2.19 | 1.01 | 0.38 | 1.48 |
+| | **sum** | **0.33** | 1.60 | **0.78** | 0.10 | **1.08** |
+| | mean | 0.25 | 1.63 | 0.81 | 0.09 | 1.17 |
+| | sum-pmi | 0.25 | 1.60 | 0.82 | 0.21 | 1.12 |
+| | mean-pmi | 0.25 | **1.59** | 0.79 | **0.03** | 1.17 |
+
+- No single zero-shot scorer wins: letter-logit is clearly best on knowledge MC (ARC) and worst on ordinal sentiment (SST-5). Summed likelihood shows the expected length and prior bias on ARC (NLL 4.0), and PMI recovers a lot of it.
+- SST-5 is weak for every scorer (≤ 0.33 acc against 0.2 chance). That's the case trained Score heads (M2) need to beat.
+- CPU cost is 1.4–5.5 s per example (PMI runs two forks). Rerun on GPU with n ≥ 500 before drawing finer conclusions.
+
 Design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
 - `<|read|>` gets id 248077. The tokenizer uses 248,077 ids but the embedding has 248,320 rows, so no resize is needed.
