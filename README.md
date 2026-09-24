@@ -10,6 +10,16 @@ A prototype of a "System One" decision model, inspired by TypeSafe AI's **Jev**.
 
 The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md) for milestones. Current scope is **inference only**; training and fine-tuning (PLAN.md M2) are on hold.
 
+| Milestone | Status |
+|---|---|
+| **M0** backbone spike (prefix fork) | ✅ Done. Fork = full forward on real weights (CPU, CUDA + fla, fp32/fp16); 8–19× faster than one forward per branch; chunked branches bound memory. Gradient-through-cache check deferred until training resumes. |
+| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 3 datasets (CPU, n = 100). Remaining: GPU numbers at larger n, two-level fork. |
+| **M2** training (LoRA + heads) | ⏸ On hold |
+| **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
+| **M4** serving / **M5** multimodal | Not started |
+
+**Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box.
+
 ### Key design change: prefix-fork instead of a tree mask
 Qwen3.5-0.8B is a hybrid model: 24 layers = **18 Gated DeltaNet (linear attention) + 6 gated full attention**. A tree attention mask (§2.2, §5.4 below) cannot isolate sibling branches inside recurrent layers, so this repo uses **prefix-fork execution** instead:
 
@@ -27,7 +37,7 @@ Branches are isolated in every layer type by construction, and results can't dep
 | `scripts/bench_fork.py` | Latency and peak memory: fork vs. one forward per branch, across state lengths and branch counts |
 | `notebooks/m0_gpu_checks.ipynb` | Colab notebook: installs `flash-linear-attention`, runs the tests on GPU, then the benchmark |
 
-### Results so far (Mac CPU, fp32, torch fallback kernels)
+### M0 results: Mac CPU (fp32, torch fallback kernels)
 | Check | Max abs diff |
 |---|---|
 | Tiny model, fork vs. sequential | ~7e-7 (tolerance 1e-5) |
@@ -35,7 +45,7 @@ Branches are isolated in every layer type by construction, and results can't dep
 | 0.8B with forked recurrent state zeroed (negative control) | 6.3 |
 | 0.8B with forked conv state zeroed (negative control) | 3.1 |
 
-### GPU results (2026-09-24, RTX 2080 Ti 11 GB, sm75, fla 0.5.2, torch 2.14, no `causal-conv1d`)
+### M0 results: GPU (2026-09-24, RTX 2080 Ti 11 GB, sm75, fla 0.5.2, torch 2.14, no `causal-conv1d`)
 All fast tests pass on CUDA with both the torch fallback and the fla DeltaNet kernels (fla is picked up automatically once installed).
 
 | Check | Result |
@@ -57,7 +67,7 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | 4096 | 10 | 895 | 553 | 4.70 | 9976 | 11.2× |
 | 4096 | 200 | 3196 | – | 7.39 | – | – |
 
-### Findings
+### M0 findings
 - **`DynamicCache.batch_repeat_interleave` can't fork this model** (transformers 5.17). `LinearAttentionLayer` has no such method, and `LinearAttentionAndFullAttentionLayer` inherits `DynamicLayer`'s, which repeats only keys and values. Hence the custom `expand_cache`.
 - **The cache updates DeltaNet state in place** (`copy_`), so backward through a forked cache fails. This only matters for training, which is out of scope for now.
 - **Tiny random models barely use DeltaNet state.** Zeroing it moves reads by only ~1e-4, so tiny-model tests use a 1e-5 tolerance to stay sensitive.
@@ -66,13 +76,6 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 - **On Turing, fla's DeltaNet kernel is the bottleneck, not the GEMMs.** Profiling a 2048-token state × 50 branches in fp16: `ChunkGatedDeltaRule` is 64% of GPU time (mostly `chunk_fwd_kernel_o`), linear layers 13%, attention 4%. That's why fp16 is barely faster than fp32 for short states. For 24-token branches the torch fallback was actually faster (512 × 50: 275 ms vs 361 ms fla), probably because the chunk kernel pads each short branch to a 64-token chunk. Recheck on Ampere+ before choosing a kernel per phase (fla for the state prefill, and possibly `fused_recurrent` or torch for short branches).
 - **With fla installed, the model can't run on CPU.** transformers binds DeltaNet to fla at import time whatever the device, and Triton then fails with "0 active drivers". `tests/conftest.py` hides fla when CUDA is unavailable. Do the same (`sys.modules["fla"] = None` before importing transformers) in any CPU script.
 - **Hardware incident:** running benchmarks on both 2080 Tis at once made GPU 0 fall off the bus (`nvidia-smi`: "Unable to determine the device handle ... Unknown Error"). After that, CUDA init failed on both GPUs until a reset. Run one GPU job at a time on this box.
-
-### Open items
-- [x] Run the M0 GPU checks: fork equivalence with the fla kernel and the fork-vs-sequential benchmark (above)
-- [ ] Gradient through the forked cache (PLAN.md M0 step 4): blocked by in-place cache updates; only needed once training resumes
-- [x] M1 (inference slice): typed API, templates, `<|read|>` heads, zero-shot baselines (below)
-- [ ] M1 remainder: zero-shot numbers on GPU at a larger n; a two-level fork so long questions aren't recomputed per option
-- [ ] M2 (on hold): train `DecisionHeads` + LoRA so `HeadScorer` becomes the real model
 
 ### What's built (M1, inference only)
 | Path | What it does |
@@ -85,7 +88,8 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | `tests/test_predict.py` | Schema validation, rendering independent of option order, answer well-formedness, **question/option-order invariance and fan-out = single-question answers for every scorer** (< 1e-5), fork likelihood = unforked likelihood, PMI arithmetic, `<|read|>` fits in the embedding |
 | `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge (choice), BoolQ (noul), SST-5 (score) |
 
-Zero-shot baselines (`scripts/zero_shot_eval.py --device cpu --limit 100`, Qwen3.5-0.8B-Base fp32, seed 0; 95% CI on accuracy ≈ ±0.09 at n = 100):
+### M1 results: zero-shot baselines
+`scripts/zero_shot_eval.py --device cpu --limit 100`: Qwen3.5-0.8B-Base, fp32, seed 0. At n = 100, the 95% CI on accuracy is about ±0.09.
 
 | dataset (type, K) | scorer | acc | NLL | Brier | ECE-15 | MAE |
 |---|---|---|---|---|---|---|
@@ -107,11 +111,18 @@ Zero-shot baselines (`scripts/zero_shot_eval.py --device cpu --limit 100`, Qwen3
 - SST-5 is weak for every scorer (≤ 0.33 acc against 0.2 chance). That's the case trained Score heads (M2) need to beat.
 - CPU cost is 1.4–5.5 s per example (PMI runs two forks). Rerun on GPU with n ≥ 500 before drawing finer conclusions.
 
-Design notes:
+M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
 - `<|read|>` gets id 248077. The tokenizer uses 248,077 ids but the embedding has 248,320 rows, so no resize is needed.
 - The invariance tests are sensitive: rendering options in caller order makes all four scorers fail them (1e-1 to 3e-4 diffs).
 - In the ARC and SST-5 converters, the question or review text is the state, so PMI's empty-state baseline is meaningful.
+
+### Next steps
+- [ ] Recover the GPU (reboot / `nvidia-smi -r`), then on one GPU: finish the fp16 benchmark rows (4096 × 50+) and rerun `zero_shot_eval.py` at n ≥ 500
+- [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
+- [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)
+- [ ] M3: temperature fitting per (type, K-bucket) on the zero-shot scorers, plus the stress suite (permutation, K scaling, fan-out, empty state)
+- [ ] M2 (on hold): train `DecisionHeads` + LoRA so `HeadScorer` becomes the real model. Needs gradients through the forked cache, which in-place cache updates currently block (PLAN.md fallback A: per-row `[state, branch]` concatenation)
 
 ### Quickstart
 ```bash

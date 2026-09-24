@@ -2,6 +2,8 @@
 
 Companion to `README.md` (the design brief). This plan turns that brief into a buildable project on **`Qwen/Qwen3.5-0.8B-Base`**, and records where the backbone forces changes to the brief.
 
+> **Status (2026-09-24):** M0 ✅ done (gradient-through-cache deferred with training). M1 🟡 inference slice done: typed `predict()`, zero-shot and `<|read|>`-head scorers, invariance tests, zero-shot baselines. M2 ⏸ on hold (inference-only scope). M3 has metrics only. M4 and M5 not started. Details and numbers are in README "Project status"; next steps are at the end of this file.
+
 ---
 
 ## 0. Backbone facts that change the design
@@ -62,6 +64,8 @@ evals/ converters/ stress/ baselines/ run_eval.py
 tests/ test_fork_equivalence.py test_permutation.py test_padding.py test_cache_grad.py
 ```
 
+**As built (2026-09-24):** `fork.py`, `schema.py`, `templates.py`, `scorers.py` (backbone wrapper, zero-shot scorers, `DecisionHeads`; this takes the roles planned for `packing.py` and the inference half of `model.py`), `predict.py` (the typed API that `serve.py` will wrap), and `metrics.py`. Tests are `test_fork_equivalence.py` (padding and sibling cases included) and `test_predict.py` (permutation and fan-out invariance). Scripts are `bench_fork.py` and `zero_shot_eval.py` (dataset converters inline for now). Extras: `[cuda]` = flash-linear-attention, `[eval]` = datasets. `causal-conv1d` is not used (its build OOM-killed Colab; the torch conv path is cheap).
+
 ## 2. Milestone M0 — backbone spike (days 1–3) ⛳ go/no-go
 
 Retire the architectural risk before writing anything else.
@@ -75,6 +79,11 @@ Retire the architectural risk before writing anything else.
 5. Measure memory and throughput for state 2k tokens × 50 branches on a 24 GB GPU.
 
 **Deliverable:** `fork.py` + the 3 tests green, plus a short note on which gradient path works.
+
+**Outcome (✅ go):**
+- Steps 1–3: done. Fork vs. full forward on real weights: 4.8e-5 (Mac CPU fallback) and 2.3e-5 (RTX 2080 Ti, fla, fp32); fp16 min cos 0.999998. Negative controls (zeroed recurrent or conv state) diverge by 3–6.
+- Step 5 (on 11 GB instead of 24 GB): 2k-token state × 50 branches takes 0.78 s fp32 / 0.56 s fp16 with `chunk_size=25`, at 5.4 GiB. The fork is 8–19× faster than one forward per branch. Unchunked it OOMs, because every branch row copies the attention KV.
+- Step 4: **deferred.** The transformers cache updates DeltaNet state in place (`copy_`), so backward through a forked cache fails. Resolve it when M2 resumes, via fallback A (per-row `[state, branch]` concatenation) or an out-of-place cache.
 
 ## 3. Milestone M1 — packing, heads, inference API (week 1)
 
@@ -98,6 +107,14 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 **Zero-shot baseline in the same harness:** letter-logit reading and PMI-corrected sequence log-likelihood (README §7.7 #1–2) on the same backbone.
 
 **Deliverable:** `serve.predict(request) → typed response` matching TypeSafe's shapes. Unit tests for permutation invariance (question order *and* option order) pass with max diff < 1e-3.
+
+**Outcome (🟡 inference slice done):**
+- `predict(request, scorer, temperature)` in `predict.py` returns `ChoiceAnswer` / `ScoreAnswer` / `NoulAnswer`. Question ids never reach the model.
+- Templates follow the plan. Options are listed by key in canonical sorted order (no training-time shuffle yet). Score answers read `Level i of K: {desc}`. Noul reads at the end of `Answer (yes/no):` (head) or compares ` yes`/` no` (zero-shot).
+- `<|read|>` = id 248077, which fits in the checkpoint's spare embedding rows (no resize). `DecisionHeads` = `option_head` (shared by Choice/Score) + `noul_head`. They are untrained, and the cumulative-link Score head is not built.
+- Zero-shot scorers: letter-logit, sum/mean likelihood, and PMI against an empty state. Invariance (question order, option order, fan-out) holds to < 1e-5 for every scorer, and the tests fail if options are rendered in caller order.
+- Zero-shot numbers (CPU, n = 100): letter-logit is best on ARC-Challenge (0.60), PMI is best on BoolQ (0.79), and every scorer is weak on SST-5 (≤ 0.33). See README.
+- Remaining: GPU numbers at n ≥ 500; a FastAPI wrapper (M4).
 
 ## 4. Milestone M2 — training (weeks 2–3)
 
@@ -155,7 +172,9 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 | Risk | Mitigation |
 |---|---|
 | fla backward doesn't support grads through `initial_state` | Fallback A: per-row `[state, branch]` concatenation (exact, costs O(branches × state)) for training only. Serving still forks. |
-| Expanded caches blow memory at K=200 with long states | The DeltaNet state is constant-size (16 heads × 128 × 128 per layer). Only the 6 attention layers grow with state length; use `expand` rather than copy for KV, and chunk branches. |
+| Expanded caches blow memory at K=200 with long states | **Confirmed** (2k × 50 OOMs on 11 GB). `expand` doesn't help, because the cache update concatenates and materialises the KV. **Mitigated** by `chunk_size`, which keeps memory flat in K. A two-level fork would also cut per-row cost. |
+| fla's DeltaNet kernel is slow on pre-Ampere GPUs | Measured on Turing: 64% of GPU time, and slower than the torch path for short branches. Choose the kernel per phase, and benchmark on Ampere+ before optimising. |
+| fla installed but running on CPU | transformers binds fla at import time for any device, and Triton then fails. Hide fla on CPU (`tests/conftest.py`, `Backbone.from_pretrained`). |
 | 0.8B too weak for hard knowledge tasks (MMLU/GPQA) | Expected. Judge it on calibration (confidence drops when out of depth), not raw accuracy. The same code scales to Qwen3.5-2B/4B/9B. |
 | Tokenizer has no clean "last token" for option text | The `<|read|>` sentinel token |
 | Kernels unavailable on Mac | Keep the pure-torch path for tests; do real runs on CUDA |
@@ -172,7 +191,9 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 | 4–5 | M4 | Server + latency curves |
 | 6+ | M5 / RLCD v2 | Multimodal, soft-label training experiments |
 
-## Immediate next steps
-1. `git init`, create the skeleton above, and pin versions.
-2. Write `tests/test_fork_equivalence.py` against `Qwen3.5-0.8B-Base` (CPU, fp32, tiny inputs).
-3. Get a CUDA box and run the M0 gradient-through-cache check with fla kernels.
+## Immediate next steps (updated 2026-09-24)
+1. Recover the dev box GPU (GPU 0 fell off the bus; CUDA init fails until a reboot or reset). Run one GPU job at a time.
+2. On GPU: finish the fp16 benchmark rows, and rerun `scripts/zero_shot_eval.py` at n ≥ 500 on more datasets (ARC-Easy, CommonsenseQA, AG News for large K).
+3. M3 on the zero-shot scorers: fit temperature per (type, K-bucket), plus reliability plots and the stress suite (permutation, K scaling, fan-out, empty state).
+4. Two-level fork (state → question cache → answers) and per-phase kernel choice.
+5. When training resumes (M2): pick the gradient path (fallback A or an out-of-place cache), then train `DecisionHeads` + LoRA.
