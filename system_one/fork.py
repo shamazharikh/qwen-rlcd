@@ -55,15 +55,26 @@ def forward_branches(
     state_len: int,
     branches: list[list[int]],
     pad_id: int,
+    chunk_size: int | None = None,
 ) -> torch.Tensor:
-    """Run `branches` as one right-padded batch continuing from `state_cache`.
+    """Run `branches` as right-padded batches continuing from `state_cache`.
 
     Returns final-norm hidden states at each branch's last real token, shape [N, d]. Right padding
     is safe without a mask: everything is causal, so pad tokens after the read position cannot
     influence it (they only pollute the per-branch cache, which is discarded).
+
+    Each branch row holds its own copy of the attention-layer KV, so memory grows with
+    #branches × state length. `chunk_size` caps the rows per forward; reads don't depend on it.
     """
     if any(len(b) == 0 for b in branches):
         raise ValueError("branches must be non-empty")
+    if chunk_size is not None and chunk_size < len(branches):
+        return torch.cat(
+            [
+                forward_branches(text_model, state_cache, state_len, branches[i : i + chunk_size], pad_id)
+                for i in range(0, len(branches), chunk_size)
+            ]
+        )
     device = text_model.embed_tokens.weight.device
     n, max_len = len(branches), max(len(b) for b in branches)
     input_ids = torch.full((n, max_len), pad_id, dtype=torch.long, device=device)
@@ -77,10 +88,16 @@ def forward_branches(
     return out.last_hidden_state[torch.arange(n, device=device), last_idx]
 
 
-def fork_forward(text_model, state_ids: torch.LongTensor, branches: list[list[int]], pad_id: int) -> torch.Tensor:
+def fork_forward(
+    text_model,
+    state_ids: torch.LongTensor,
+    branches: list[list[int]],
+    pad_id: int,
+    chunk_size: int | None = None,
+) -> torch.Tensor:
     """Prefill `state_ids` ([1, S]) once, then read every branch. Returns [N, d]."""
     cache = prefill_state(text_model, state_ids)
-    return forward_branches(text_model, cache, state_ids.shape[1], branches, pad_id)
+    return forward_branches(text_model, cache, state_ids.shape[1], branches, pad_id, chunk_size)
 
 
 def sequential_reads(text_model, state_ids: torch.LongTensor, branches: list[list[int]]) -> torch.Tensor:

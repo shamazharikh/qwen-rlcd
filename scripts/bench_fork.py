@@ -57,13 +57,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B-Base")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", default=None, choices=["float32", "bfloat16"], help="default: bf16 on Ampere+")
+    parser.add_argument("--dtype", default=None, choices=["float32", "bfloat16", "float16"], help="default: bf16 on Ampere+")
     parser.add_argument("--tiny", action="store_true")
     parser.add_argument("--state-lens", default="512,2048")
     parser.add_argument("--branch-counts", default="1,10,50,100")
     parser.add_argument("--branch-len", type=int, default=24)
     parser.add_argument("--max-sequential", type=int, default=50, help="skip the sequential baseline above this")
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--chunk-size", type=int, default=None, help="max branch rows per fork forward")
     args = parser.parse_args()
     if args.dtype is None:
         ampere = args.device == "cuda" and torch.cuda.get_device_capability()[0] >= 8
@@ -73,7 +74,7 @@ def main():
     model, vocab = load(args)
     gen = torch.Generator().manual_seed(0)
     hardware = torch.cuda.get_device_name() if args.device == "cuda" else args.device
-    print(f"\n{'tiny' if args.tiny else args.model} on {hardware}, {args.dtype}, branch_len={args.branch_len}\n")
+    print(f"\n{'tiny' if args.tiny else args.model} on {hardware}, {args.dtype}, branch_len={args.branch_len}, chunk_size={args.chunk_size}\n")
     print("| state tokens | branches | fork ms | fork peak GiB | sequential ms | sequential peak GiB | speedup |")
     print("|---|---|---|---|---|---|---|")
     for state_len in map(int, args.state_lens.split(",")):
@@ -81,7 +82,7 @@ def main():
         for n in map(int, args.branch_counts.split(",")):
             branches = torch.randint(1, vocab, (n, args.branch_len), generator=gen).tolist()
             with torch.no_grad():
-                fork_ms, fork_mem = measure(lambda: fork_forward(model, state, branches, 0), args.device, args.repeats)
+                fork_ms, fork_mem = measure(lambda: fork_forward(model, state, branches, 0, args.chunk_size), args.device, args.repeats)
                 if n <= args.max_sequential:
                     seq_ms, seq_mem = measure(lambda: sequential_reads(model, state, branches), args.device, args.repeats)
                     seq = f"{seq_ms:.1f} | {seq_mem:.2f} | {seq_ms / fork_ms:.1f}x"

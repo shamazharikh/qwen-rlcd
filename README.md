@@ -6,7 +6,7 @@ A prototype of a "System One" decision model, inspired by TypeSafe AI's **Jev**.
 
 ---
 
-## Project status (2026-09-17)
+## Project status (2026-09-24)
 
 The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md) for milestones. Current scope is **inference only**; training and fine-tuning (PLAN.md M2) are on hold.
 
@@ -22,7 +22,7 @@ Branches are isolated in every layer type by construction, and results can't dep
 ### What's built (M0)
 | Path | What it does |
 |---|---|
-| `system_one/fork.py` | `prefill_state`, `expand_cache`, `forward_branches`, `fork_forward`, plus a `sequential_reads` reference (one uncached full forward per branch) |
+| `system_one/fork.py` | `prefill_state`, `expand_cache`, `forward_branches`, `fork_forward` (optional `chunk_size` to bound memory), plus a `sequential_reads` reference (one uncached full forward per branch) |
 | `tests/test_fork_equivalence.py` | Fork vs. sequential equivalence on a tiny random hybrid model and on real 0.8B weights; covers padding and sibling independence, conv-kernel and delta-rule chunk edge cases, source-cache immutability, and sensitivity checks that must fail when DeltaNet state isn't forked. Runs on CUDA when available. |
 | `scripts/bench_fork.py` | Latency and peak memory: fork vs. one forward per branch, across state lengths and branch counts |
 | `notebooks/m0_gpu_checks.ipynb` | Colab notebook: installs `flash-linear-attention`, runs the tests on GPU, then the benchmark |
@@ -35,14 +35,41 @@ Branches are isolated in every layer type by construction, and results can't dep
 | 0.8B with forked recurrent state zeroed (negative control) | 6.3 |
 | 0.8B with forked conv state zeroed (negative control) | 3.1 |
 
+### GPU results (2026-09-24, RTX 2080 Ti 11 GB, sm75, fla 0.5.2, torch 2.14, no `causal-conv1d`)
+All fast tests pass on CUDA with both the torch fallback and the fla DeltaNet kernels (fla is picked up automatically once installed).
+
+| Check | Result |
+|---|---|
+| **Qwen3.5-0.8B-Base, fork vs. sequential, fp32, fla** | max abs diff **2.3e-5** (tolerance 1e-3), min cos 1.000000 |
+| Same, fp16 (Turing has no bf16) | max abs diff 4.7e-2, min cos 0.999998 |
+
+Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of 5). Sequential = one full forward per branch, measured up to 10 branches.
+
+| state tokens | branches | fork ms fp32 | fork ms fp16 | fork peak GiB fp32 | sequential ms fp32 | speedup (fp32) |
+|---|---|---|---|---|---|---|
+| 512 | 1 | 118 | 108 | 2.91 | 108 | 0.9× |
+| 512 | 10 | 135 | 126 | 3.25 | 1137 | 8.4× |
+| 512 | 50 | 394 | 361 | 3.87 | (7101 unchunked) | 19× |
+| 512 | 200 | 1378 | 1256 | 3.87 | – | – |
+| 2048 | 10 | 535 | 298 | 3.87 | 4618 | 8.6× |
+| 2048 | 50 | 777 | 555 | 5.38 | – | – |
+| 2048 | 200 | 1963 | 1545 | 5.38 | – | – |
+| 4096 | 10 | 895 | 553 | 4.70 | 9976 | 11.2× |
+| 4096 | 200 | 3196 | – | 7.39 | – | – |
+
 ### Findings
 - **`DynamicCache.batch_repeat_interleave` can't fork this model** (transformers 5.17). `LinearAttentionLayer` has no such method, and `LinearAttentionAndFullAttentionLayer` inherits `DynamicLayer`'s, which repeats only keys and values. Hence the custom `expand_cache`.
 - **The cache updates DeltaNet state in place** (`copy_`), so backward through a forked cache fails. This only matters for training, which is out of scope for now.
 - **Tiny random models barely use DeltaNet state.** Zeroing it moves reads by only ~1e-4, so tiny-model tests use a 1e-5 tolerance to stay sensitive.
 - **Colab (T4):** compiling `causal-conv1d` ran the VM out of memory and killed the runtime twice, so the notebook now installs only `flash-linear-attention`. A third attempt couldn't connect to a runtime at all.
+- **Unchunked forks run out of memory on long states.** Every branch row gets its own copy of the attention-layer KV (and SDPA's `repeat_kv` copies it again), so memory grows with #branches × state length: 2048 tokens × 50 branches OOMs on 11 GB. `forward_branches(..., chunk_size=N)` caps the rows per forward; with `chunk_size=25`, peak memory is flat in the branch count (table above). `expand` instead of copy wouldn't help, because `DynamicLayer.update` concatenates and materialises the KV anyway.
+- **On Turing, fla's DeltaNet kernel is the bottleneck, not the GEMMs.** Profiling a 2048-token state × 50 branches in fp16: `ChunkGatedDeltaRule` is 64% of GPU time (mostly `chunk_fwd_kernel_o`), linear layers 13%, attention 4%. That's why fp16 is barely faster than fp32 for short states. For 24-token branches the torch fallback was actually faster (512 × 50: 275 ms vs 361 ms fla), probably because the chunk kernel pads each short branch to a 64-token chunk. Recheck on Ampere+ before choosing a kernel per phase (fla for the state prefill, and possibly `fused_recurrent` or torch for short branches).
+- **With fla installed, the model can't run on CPU.** transformers binds DeltaNet to fla at import time whatever the device, and Triton then fails with "0 active drivers". `tests/conftest.py` hides fla when CUDA is unavailable. Do the same (`sys.modules["fla"] = None` before importing transformers) in any CPU script.
+- **Hardware incident:** running benchmarks on both 2080 Tis at once made GPU 0 fall off the bus (`nvidia-smi`: "Unable to determine the device handle ... Unknown Error"). After that, CUDA init failed on both GPUs until a reset. Run one GPU job at a time on this box.
 
 ### Open items
-- [ ] Run `notebooks/m0_gpu_checks.ipynb` on a GPU (Colab retry, Kaggle, or RunPod): fork equivalence with the fla kernel and the fork-vs-sequential benchmark
+- [x] Run the M0 GPU checks: fork equivalence with the fla kernel and the fork-vs-sequential benchmark (above)
+- [ ] Gradient through the forked cache (PLAN.md M0 step 4): blocked by in-place cache updates; only needed once training resumes
 - [ ] M1: templates with the option list in the branch, a `<|read|>` token, Choice/Score/Noul heads, a typed inference API, and zero-shot baselines
 
 ### Quickstart
@@ -50,7 +77,8 @@ Branches are isolated in every layer type by construction, and results can't dep
 uv venv --python 3.12 .venv && uv pip install -e '.[dev]'
 .venv/bin/python -m pytest -q                                   # fast tests (tiny model)
 QWEN_RLCD_SLOW=1 .venv/bin/python -m pytest -q -s -k qwen35     # real Qwen3.5-0.8B-Base weights
-.venv/bin/python scripts/bench_fork.py                           # benchmark (use a CUDA GPU)
+uv pip install flash-linear-attention                            # CUDA only: fla DeltaNet kernels
+.venv/bin/python scripts/bench_fork.py --chunk-size 25           # benchmark (use a CUDA GPU)
 ```
 GPU: [open the notebook in Colab](https://colab.research.google.com/github/shamazharikh/qwen-rlcd/blob/main/notebooks/m0_gpu_checks.ipynb), choose a GPU runtime, and click Run all.
 

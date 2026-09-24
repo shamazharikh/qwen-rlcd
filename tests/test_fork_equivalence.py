@@ -85,6 +85,18 @@ def test_read_independent_of_padding_and_siblings(tiny_model):
             assert (batched - alone).abs().max().item() < TINY_TOL
 
 
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 10])
+def test_chunked_branches_match_single_batch(tiny_model, chunk_size):
+    random.seed(4)
+    state_ids = torch.tensor([_rand_ids(25)], device=DEVICE)
+    branches = [_rand_ids(n) for n in (3, 11, 1, 7, 5)]
+    with torch.no_grad():
+        whole = fork_forward(tiny_model, state_ids, branches, PAD_ID)
+        chunked = fork_forward(tiny_model, state_ids, branches, PAD_ID, chunk_size=chunk_size)
+    assert chunked.shape == whole.shape
+    assert (chunked - whole).abs().max().item() < TINY_TOL
+
+
 def test_expand_cache_forks_recurrent_state_and_leaves_source_intact(tiny_model):
     random.seed(2)
     state_ids = torch.tensor([_rand_ids(12)], device=DEVICE)
@@ -122,8 +134,8 @@ def test_detects_unforked_linear_attention_state(tiny_model, monkeypatch, states
 
 
 REAL_DTYPES = [torch.float32]
-if DEVICE == "cuda" and torch.cuda.get_device_capability()[0] >= 8:
-    REAL_DTYPES.append(torch.bfloat16)
+if DEVICE == "cuda":  # half precision: bf16 on Ampere+, fp16 on older GPUs (e.g. Turing)
+    REAL_DTYPES.append(torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
 
 
 @pytest.mark.skipif(os.environ.get("QWEN_RLCD_SLOW") != "1", reason="set QWEN_RLCD_SLOW=1 to run real weights")
@@ -154,5 +166,5 @@ def test_fork_matches_sequential_qwen35_08b_base(dtype):
     print(f"\nQwen3.5-0.8B-Base [{DEVICE}, {dtype}] fork vs sequential: max abs diff {diff:.2e}, min cos {cos:.6f}")
     if dtype == torch.float32:
         assert diff < TOL
-    else:  # bf16: kernels pick different chunkings for different shapes, so compare direction only
+    else:  # bf16/fp16: kernels pick different chunkings for different shapes, so compare direction only
         assert cos > 0.9999
