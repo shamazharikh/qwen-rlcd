@@ -2,10 +2,12 @@
 name = "system-one"
 version = "0.0.1"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.5", "transformers>=5.17", "accelerate"]
+dependencies = ["torch>=2.5", "transformers>=5.17", "accelerate", "numpy"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+eval = ["datasets"]
+cuda = ["flash-linear-attention"]
 
 [build-system]
 requires = ["setuptools>=61"]

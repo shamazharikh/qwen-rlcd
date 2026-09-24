@@ -70,15 +70,41 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 ### Open items
 - [x] Run the M0 GPU checks: fork equivalence with the fla kernel and the fork-vs-sequential benchmark (above)
 - [ ] Gradient through the forked cache (PLAN.md M0 step 4): blocked by in-place cache updates; only needed once training resumes
-- [ ] M1: templates with the option list in the branch, a `<|read|>` token, Choice/Score/Noul heads, a typed inference API, and zero-shot baselines
+- [x] M1 (inference slice): typed API, templates, `<|read|>` heads, zero-shot baselines (below)
+- [ ] M1 remainder: zero-shot numbers on GPU at a larger n; a two-level fork so long questions aren't recomputed per option
+- [ ] M2 (on hold): train `DecisionHeads` + LoRA so `HeadScorer` becomes the real model
+
+### What's built (M1, inference only)
+| Path | What it does |
+|---|---|
+| `system_one/schema.py` | Parses and validates the README §5.2 request (`Request.from_dict`). Typed `ChoiceAnswer` / `ScoreAnswer` / `NoulAnswer` |
+| `system_one/templates.py` | State, question-prefix and answer-branch text, with the compact option list inside every branch (§4). Choice options are always rendered in sorted key order, so outputs don't depend on the caller's order. Letter prompts for the baseline |
+| `system_one/scorers.py` | `Backbone` (model + tokenizer + fork) and three scorers, all running every branch of every question through one prefix fork: `LetterScorer` (letter-logit reading, §7.7 #1), `LikelihoodScorer` (sum/mean answer log-likelihood, optional PMI against an empty state, §7.7 #2), `HeadScorer` (linear heads at a `<|read|>` token; heads untrained until M2) |
+| `system_one/predict.py` | `predict(request, scorer, temperature=None)` → typed answers: softmax / sigmoid, confidence = 1 − H(p)/log K, score = Σ p_i·i (0-based) |
+| `system_one/metrics.py` | Accuracy, NLL, Brier, ECE-15, and MAE for Score |
+| `tests/test_predict.py` | Schema validation, rendering independent of option order, answer well-formedness, **question/option-order invariance and fan-out = single-question answers for every scorer** (< 1e-5), fork likelihood = unforked likelihood, PMI arithmetic, `<|read|>` fits in the embedding |
+| `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge (choice), BoolQ (noul), SST-5 (score) |
+
+Design notes:
+- `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
+- `<|read|>` gets id 248077. The tokenizer uses 248,077 ids but the embedding has 248,320 rows, so no resize is needed.
+- The invariance tests are sensitive: rendering options in caller order makes all four scorers fail them (1e-1 to 3e-4 diffs).
+- In the ARC and SST-5 converters, the question or review text is the state, so PMI's empty-state baseline is meaningful.
 
 ### Quickstart
 ```bash
 uv venv --python 3.12 .venv && uv pip install -e '.[dev]'
 .venv/bin/python -m pytest -q                                   # fast tests (tiny model)
 QWEN_RLCD_SLOW=1 .venv/bin/python -m pytest -q -s -k qwen35     # real Qwen3.5-0.8B-Base weights
-uv pip install flash-linear-attention                            # CUDA only: fla DeltaNet kernels
+uv pip install -e '.[cuda]'                                      # CUDA only: fla DeltaNet kernels
 .venv/bin/python scripts/bench_fork.py --chunk-size 25           # benchmark (use a CUDA GPU)
+uv pip install -e '.[eval]' && .venv/bin/python scripts/zero_shot_eval.py --limit 200   # zero-shot baselines
+```
+```python
+from system_one.predict import predict
+from system_one.scorers import Backbone, LikelihoodScorer
+scorer = LikelihoodScorer(Backbone.from_pretrained(), normalize="sum", pmi=True)
+predict({"state": "...", "questions": {"is_urgent": {"type": "noul", "instructions": "The message conveys urgency."}}}, scorer)
 ```
 GPU: [open the notebook in Colab](https://colab.research.google.com/github/shamazharikh/qwen-rlcd/blob/main/notebooks/m0_gpu_checks.ipynb), choose a GPU runtime, and click Run all.
 

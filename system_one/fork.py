@@ -49,32 +49,31 @@ def expand_cache(cache: DynamicCache, n: int, batch_size: int = 1) -> DynamicCac
     return new
 
 
-def forward_branches(
+def forward_branches_all(
     text_model,
     state_cache: DynamicCache,
     state_len: int,
     branches: list[list[int]],
     pad_id: int,
     chunk_size: int | None = None,
-) -> torch.Tensor:
+) -> list[torch.Tensor]:
     """Run `branches` as right-padded batches continuing from `state_cache`.
 
-    Returns final-norm hidden states at each branch's last real token, shape [N, d]. Right padding
-    is safe without a mask: everything is causal, so pad tokens after the read position cannot
-    influence it (they only pollute the per-branch cache, which is discarded).
+    Returns each branch's final-norm hidden states over its real tokens, a list of [len_i, d]. Right
+    padding is safe without a mask: everything is causal, so pad tokens after a branch's last real
+    token cannot influence it (they only pollute the per-branch cache, which is discarded).
 
     Each branch row holds its own copy of the attention-layer KV, so memory grows with
-    #branches × state length. `chunk_size` caps the rows per forward; reads don't depend on it.
+    #branches × state length. `chunk_size` caps the rows per forward; outputs don't depend on it.
     """
     if any(len(b) == 0 for b in branches):
         raise ValueError("branches must be non-empty")
     if chunk_size is not None and chunk_size < len(branches):
-        return torch.cat(
-            [
-                forward_branches(text_model, state_cache, state_len, branches[i : i + chunk_size], pad_id)
-                for i in range(0, len(branches), chunk_size)
-            ]
-        )
+        return [
+            h
+            for i in range(0, len(branches), chunk_size)
+            for h in forward_branches_all(text_model, state_cache, state_len, branches[i : i + chunk_size], pad_id)
+        ]
     device = text_model.embed_tokens.weight.device
     n, max_len = len(branches), max(len(b) for b in branches)
     input_ids = torch.full((n, max_len), pad_id, dtype=torch.long, device=device)
@@ -84,8 +83,20 @@ def forward_branches(
     position_ids = torch.arange(state_len, state_len + max_len, device=device).expand(n, -1)
     cache = expand_cache(state_cache, n)
     out = text_model(input_ids=input_ids, position_ids=position_ids, past_key_values=cache, use_cache=True)
-    last_idx = torch.tensor([len(b) - 1 for b in branches], device=device)
-    return out.last_hidden_state[torch.arange(n, device=device), last_idx]
+    return [out.last_hidden_state[i, : len(b)] for i, b in enumerate(branches)]
+
+
+def forward_branches(
+    text_model,
+    state_cache: DynamicCache,
+    state_len: int,
+    branches: list[list[int]],
+    pad_id: int,
+    chunk_size: int | None = None,
+) -> torch.Tensor:
+    """Final-norm hidden states at each branch's last real token, shape [N, d] (see `forward_branches_all`)."""
+    hidden = forward_branches_all(text_model, state_cache, state_len, branches, pad_id, chunk_size)
+    return torch.stack([h[-1] for h in hidden])
 
 
 def fork_forward(
