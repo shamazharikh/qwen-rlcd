@@ -8,9 +8,26 @@ an independent batch row continuing from that cache (see PLAN.md §0).
 from __future__ import annotations
 
 import copy
+import os
 
 import torch
 from transformers.cache_utils import DynamicCache
+
+
+def force_ieee_fp32() -> None:
+    """Make fla's Triton kernels compute fp32 dots in IEEE precision instead of TF32 (Ampere+ default).
+
+    Fork and sequential passes chunk the sequence differently, so under TF32 their reads differ by
+    ~1e-3 relative (2e-2 abs on 0.8B). Exact comparisons need IEEE; scoring doesn't. fla hardcodes TF32
+    for its fused triangular solve, so that constant is patched too. Call before the first forward.
+    """
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    try:
+        import triton.language as tl
+        from fla.ops.gated_delta_rule import chunk_fwd
+    except ImportError:
+        return
+    chunk_fwd.SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
 def prefill_state(text_model, state_ids: torch.LongTensor) -> DynamicCache:
