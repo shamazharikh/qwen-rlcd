@@ -8,9 +8,26 @@ an independent batch row continuing from that cache (see PLAN.md §0).
 from __future__ import annotations
 
 import copy
+import os
 
 import torch
 from transformers.cache_utils import DynamicCache
+
+
+def force_ieee_fp32() -> None:
+    """Make fla's Triton kernels compute fp32 dots in IEEE precision instead of TF32 (Ampere+ default).
+
+    Fork and sequential passes chunk the sequence differently, so under TF32 their reads differ by
+    ~1e-3 relative (2e-2 abs on 0.8B). Exact comparisons need IEEE; scoring doesn't. fla hardcodes TF32
+    for its fused triangular solve, so that constant is patched too. Call before the first forward.
+    """
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    try:
+        import triton.language as tl
+        from fla.ops.gated_delta_rule import chunk_fwd
+    except ImportError:
+        return
+    chunk_fwd.SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
 def prefill_state(text_model, state_ids: torch.LongTensor) -> DynamicCache:
@@ -20,6 +37,23 @@ def prefill_state(text_model, state_ids: torch.LongTensor) -> DynamicCache:
     cache = DynamicCache(config=text_model.config)
     text_model(input_ids=state_ids, past_key_values=cache, use_cache=True)
     return cache
+
+
+def extend_cache(
+    text_model, cache: DynamicCache, cache_len: int, ids: list[int]
+) -> tuple[DynamicCache, torch.Tensor]:
+    """Continue a copy of `cache` (batch 1, `cache_len` tokens) with `ids`; `cache` itself is untouched.
+
+    Returns the extended cache and the hidden states over `ids` ([len, d]). Used for two-level forks:
+    state → one cache per question → that question's answer branches, so the question text is run
+    once instead of once per answer.
+    """
+    extended = expand_cache(cache, 1)
+    device = text_model.embed_tokens.weight.device
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    position_ids = torch.arange(cache_len, cache_len + len(ids), device=device)[None]
+    out = text_model(input_ids=input_ids, position_ids=position_ids, past_key_values=extended, use_cache=True)
+    return extended, out.last_hidden_state[0]
 
 
 def _repeat(value, n: int, batch_size: int):

@@ -14,7 +14,14 @@ from transformers import AutoModelForImageTextToText, AutoTokenizer
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-from system_one.fork import expand_cache, fork_forward, forward_branches, prefill_state, sequential_reads
+from system_one.fork import (
+    expand_cache,
+    extend_cache,
+    fork_forward,
+    forward_branches,
+    prefill_state,
+    sequential_reads,
+)
 
 TOL = 1e-3  # PLAN.md acceptance threshold for real weights (fp32)
 # Random tiny weights make the DeltaNet contribution small (zeroing its state moves reads ~1e-4), so the
@@ -114,6 +121,24 @@ def test_expand_cache_forks_recurrent_state_and_leaves_source_intact(tiny_model)
     assert torch.equal(first, second)
 
 
+@pytest.mark.parametrize("prefix_len", [2, 70])  # shorter than the conv kernel / crossing a delta-rule chunk
+def test_two_level_fork_matches_flat_fork(tiny_model, prefix_len):
+    """state → prefix cache → answers reads the same states as flat state → prefix + answer branches."""
+    random.seed(5 + prefix_len)
+    state_ids = torch.tensor([_rand_ids(30)], device=DEVICE)
+    prefixes = [_rand_ids(prefix_len), _rand_ids(prefix_len + 3)]
+    answers = [_rand_ids(n) for n in (1, 4, 9)]
+    with torch.no_grad():
+        cache = prefill_state(tiny_model, state_ids)
+        for prefix in prefixes:  # both prefixes reuse the state cache: extend_cache must not mutate it
+            flat = forward_branches(tiny_model, cache, 30, [prefix + a for a in answers], PAD_ID)
+            prefix_cache, prefix_hidden = extend_cache(tiny_model, cache, 30, prefix)
+            two_level = forward_branches(tiny_model, prefix_cache, 30 + len(prefix), answers, PAD_ID)
+            flat_prefix = forward_branches(tiny_model, cache, 30, [prefix], PAD_ID)[0]
+            assert (two_level - flat).abs().max().item() < TINY_TOL
+            assert (prefix_hidden[-1] - flat_prefix).abs().max().item() < TINY_TOL
+
+
 @pytest.mark.parametrize("states", ["recurrent_states", "conv_states"])
 def test_detects_unforked_linear_attention_state(tiny_model, monkeypatch, states):
     """Sensitivity check: if a DeltaNet state is not carried into the branches, the test must fail."""
@@ -166,5 +191,6 @@ def test_fork_matches_sequential_qwen35_08b_base(dtype):
     print(f"\nQwen3.5-0.8B-Base [{DEVICE}, {dtype}] fork vs sequential: max abs diff {diff:.2e}, min cos {cos:.6f}")
     if dtype == torch.float32:
         assert diff < TOL
-    else:  # bf16/fp16: kernels pick different chunkings for different shapes, so compare direction only
-        assert cos > 0.9999
+    else:  # bf16/fp16: kernels pick different chunkings for different shapes, so compare direction only.
+        # bf16 keeps 3 fewer mantissa bits than fp16 (A4000: min cos 0.99986; 2080 Ti fp16: 0.999998).
+        assert cos > (0.9995 if dtype == torch.bfloat16 else 0.9999)

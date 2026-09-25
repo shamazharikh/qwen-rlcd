@@ -20,18 +20,30 @@ def ece(confidences, correct, bins: int = 15) -> float:
     return float(total)
 
 
+def auroc(scores, positive) -> float:
+    """Area under the ROC curve of `scores` for separating positives (ties count half). NaN if one class is absent."""
+    s, y = np.asarray(scores, float), np.asarray(positive, bool)
+    pos, neg = s[y], s[~y]
+    if not len(pos) or not len(neg):
+        return float("nan")
+    greater = (pos[:, None] > neg[None, :]).sum() + 0.5 * (pos[:, None] == neg[None, :]).sum()
+    return float(greater / (len(pos) * len(neg)))
+
+
 def categorical_metrics(probs: list[np.ndarray], gold: list[int]) -> dict[str, float]:
-    """Accuracy, NLL, multi-class Brier and ECE-15 (on top-1 probability) for per-example distributions."""
+    """Accuracy, NLL, multi-class Brier, ECE-15 and AUROC (both on top-1 probability) for per-example distributions."""
     top = [int(np.argmax(p)) for p in probs]
     correct = [t == g for t, g in zip(top, gold)]
     nll = [-math.log(max(p[g], 1e-12)) for p, g in zip(probs, gold)]
     brier = [float(((p - np.eye(len(p))[g]) ** 2).sum()) for p, g in zip(probs, gold)]
+    top_p = [p[t] for p, t in zip(probs, top)]
     return {
         "n": len(gold),
         "acc": float(np.mean(correct)),
         "nll": float(np.mean(nll)),
         "brier": float(np.mean(brier)),
-        "ece15": ece([p[t] for p, t in zip(probs, top)], correct),
+        "ece15": ece(top_p, correct),
+        "auroc": auroc(top_p, correct),
     }
 
 
