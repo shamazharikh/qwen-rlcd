@@ -6,19 +6,19 @@ A prototype of a "System One" decision model, inspired by TypeSafe AI's **Jev**.
 
 ---
 
-## Project status (2026-09-24)
+## Project status (2026-09-25)
 
 The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md) for milestones. Current scope is **inference only**; training and fine-tuning (PLAN.md M2) are on hold.
 
 | Milestone | Status |
 |---|---|
 | **M0** backbone spike (prefix fork) | ✅ Done. Fork = full forward on real weights (CPU, CUDA + fla, fp32/fp16); 8–19× faster than one forward per branch; chunked branches bound memory. Gradient-through-cache check deferred until training resumes. |
-| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 3 datasets (CPU, n = 100). Remaining: GPU numbers at larger n, two-level fork. |
+| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, two-level fork for likelihood scoring, zero-shot numbers on 8 datasets (GPU, 500 test examples each). Remaining: trained heads (M2). |
 | **M2** training (LoRA + heads) | ⏸ On hold |
-| **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
+| **M3** calibration and eval | 🟡 On the zero-shot scorers: temperature per (type, K-bucket) and T(log K) (`calibrate.py`), calibrated eval with AUROC, stress suite (K scaling, empty-state prior, length bias). Reliability plots and the trained model's numbers remain. |
 | **M4** serving / **M5** multimodal | Not started |
 
-**Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box.
+**Environment:** runs in Docker (`Dockerfile`, `scripts/docker_run.sh`) on 2× RTX A4000 (16 GB, sm86, driver 550 / CUDA 12.4): torch 2.14 cu126, transformers 5.17, fla 0.5.2. The HF hub cache and the Triton kernel/autotune cache live on `/big/mazhar/qwen-rlcd` (mounted at `/cache`). The earlier M0 numbers come from a 2× RTX 2080 Ti box (one of its GPUs fell off the PCIe bus during a dual-GPU benchmark). On the A4000s, two GPU jobs at once have run for ~2 h without trouble.
 
 ### Key design change: prefix-fork instead of a tree mask
 Qwen3.5-0.8B is a hybrid model: 24 layers = **18 Gated DeltaNet (linear attention) + 6 gated full attention**. A tree attention mask (§2.2, §5.4 below) cannot isolate sibling branches inside recurrent layers, so this repo uses **prefix-fork execution** instead:
@@ -67,6 +67,9 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | 4096 | 10 | 895 | 553 | 4.70 | 9976 | 11.2× |
 | 4096 | 200 | 3196 | – | 7.39 | – | – |
 
+### M0 results: GPU (2026-09-25, RTX A4000 16 GB, sm86, fla 0.5.2, torch 2.14 cu126, Docker)
+All 48 tests pass, including real weights: fork vs. sequential max abs diff **2.9e-5 to 5.7e-5** in fp32 (with IEEE fp32 kernels, see below). In bf16 the min cos is 0.99986 (max abs diff 0.38).
+
 ### M0 findings
 - **`DynamicCache.batch_repeat_interleave` can't fork this model** (transformers 5.17). `LinearAttentionLayer` has no such method, and `LinearAttentionAndFullAttentionLayer` inherits `DynamicLayer`'s, which repeats only keys and values. Hence the custom `expand_cache`.
 - **The cache updates DeltaNet state in place** (`copy_`), so backward through a forked cache fails. This only matters for training, which is out of scope for now.
@@ -75,7 +78,9 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 - **Unchunked forks run out of memory on long states.** Every branch row gets its own copy of the attention-layer KV (and SDPA's `repeat_kv` copies it again), so memory grows with #branches × state length: 2048 tokens × 50 branches OOMs on 11 GB. `forward_branches(..., chunk_size=N)` caps the rows per forward; with `chunk_size=25`, peak memory is flat in the branch count (table above). `expand` instead of copy wouldn't help, because `DynamicLayer.update` concatenates and materialises the KV anyway.
 - **On Turing, fla's DeltaNet kernel is the bottleneck, not the GEMMs.** Profiling a 2048-token state × 50 branches in fp16: `ChunkGatedDeltaRule` is 64% of GPU time (mostly `chunk_fwd_kernel_o`), linear layers 13%, attention 4%. That's why fp16 is barely faster than fp32 for short states. For 24-token branches the torch fallback was actually faster (512 × 50: 275 ms vs 361 ms fla), probably because the chunk kernel pads each short branch to a 64-token chunk. Recheck on Ampere+ before choosing a kernel per phase (fla for the state prefill, and possibly `fused_recurrent` or torch for short branches).
 - **With fla installed, the model can't run on CPU.** transformers binds DeltaNet to fla at import time whatever the device, and Triton then fails with "0 active drivers". `tests/conftest.py` hides fla when CUDA is unavailable. Do the same (`sys.modules["fla"] = None` before importing transformers) in any CPU script.
-- **Hardware incident:** running benchmarks on both 2080 Tis at once made GPU 0 fall off the bus (`nvidia-smi`: "Unable to determine the device handle ... Unknown Error"). After that, CUDA init failed on both GPUs until a reset. Run one GPU job at a time on this box.
+- **On Ampere+, fla computes fp32 dots in TF32.** fla sets `TRITON_F32_DEFAULT=ieee` only on pre-Ampere cards, and it hardcodes TF32 for the fused triangular solve in `gated_delta_rule/chunk_fwd.py`. Under TF32, fork and sequential reads differ by ~1e-3 relative (2e-2 abs on 0.8B), because the two paths chunk the sequence differently. `fork.force_ieee_fp32()` sets the env var and patches that constant, which brings the A4000 back to 2.9e-5. The tests call it (`tests/conftest.py`). Scoring runs keep TF32, since 1e-3 relative is harmless there.
+- **Docker image notes:** the default PyPI torch wheels need a CUDA 13 driver, so the image installs torch from the cu126 index, which runs on the 550 driver. Triton compiles a C launcher at runtime, so the slim image needs `gcc`. The first fla run compiles and autotunes for ~75–110 s; with the Triton cache persisted, a new container starts in ~2.5 s.
+- **Hardware incident (2080 Ti box):** running benchmarks on both 2080 Tis at once made GPU 0 fall off the bus (`nvidia-smi`: "Unable to determine the device handle ... Unknown Error"). After that, CUDA init failed on both GPUs until a reset. Run one GPU job at a time on this box.
 
 ### What's built (M1, inference only)
 | Path | What it does |
@@ -86,30 +91,86 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | `system_one/predict.py` | `predict(request, scorer, temperature=None)` → typed answers: softmax / sigmoid, confidence = 1 − H(p)/log K, score = Σ p_i·i (0-based) |
 | `system_one/metrics.py` | Accuracy, NLL, Brier, ECE-15, and MAE for Score |
 | `tests/test_predict.py` | Schema validation, rendering independent of option order, answer well-formedness, **question/option-order invariance and fan-out = single-question answers for every scorer** (< 1e-5), fork likelihood = unforked likelihood, PMI arithmetic, `<|read|>` fits in the embedding |
-| `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge (choice), BoolQ (noul), SST-5 (score) |
+| `system_one/fork.py` (M1 addition) | `extend_cache` for **two-level forks**: state → one cache per question → its answer branches, so the question text (and its option list) runs once per question, not once per option. `force_ieee_fp32()` for exact comparisons on Ampere+ |
+| `system_one/scorers.py` (M1 addition) | `Backbone.run_grouped`; `LikelihoodScorer` uses the two-level fork (Banking77, K = 77: 5.5 → 0.61 s/example on the A4000) |
+| `system_one/calibrate.py` | `TemperatureTable` (one T per type × K-bucket ≤5 / 6–20 / >20, NLL-fitted with L-BFGS, T = 1 below 20 records) and `LogKTemperature` (T = exp(a + b·log K), separate noul T). Both are `temperature(type, K)` callables for `predict` and serialise to JSON |
+| `system_one/metrics.py` | Adds AUROC of top-1 confidence vs. correctness |
+| `scripts/zero_shot_eval.py` | Zero-shot baselines through the typed API on 8 datasets. Dumps raw logits, splits each dataset in half (calibration / test), fits both temperature models on the pooled calibration halves per scorer, and reports test metrics before and after. `--from-dump a.pt,b.pt` refits without the model |
+| `scripts/stress_eval.py` | K scaling (Banking77 with K = 2…77), empty-state prior, length bias |
+| `tests/test_calibrate.py` | Temperature fits recover known temperatures on synthetic data; per-bucket fallback; JSON round trip |
 
-### M1 results: zero-shot baselines
-`scripts/zero_shot_eval.py --device cpu --limit 100`: Qwen3.5-0.8B-Base, fp32, seed 0. At n = 100, the 95% CI on accuracy is about ±0.09.
+### M1/M3 results: zero-shot baselines with temperature calibration
+`scripts/docker_run.sh python scripts/zero_shot_eval.py --limit 1000` (two runs split by dataset across the two GPUs, merged with `--from-dump`): Qwen3.5-0.8B-Base, fp32, seed 0. There are 1000 random examples per dataset (TREC: all 500), split into even-index calibration and odd-index test halves. Numbers are on the **test halves (n = 500, TREC 250)**, so the 95% CI on accuracy is about ±0.04. Letter prompts support at most 26 options, so Banking77 has no letter row.
 
-| dataset (type, K) | scorer | acc | NLL | Brier | ECE-15 | MAE |
+**Accuracy** (temperature never changes the argmax):
+
+| dataset (type, K) | letter | sum | mean | sum-pmi | mean-pmi | chance |
 |---|---|---|---|---|---|---|
-| ARC-Challenge (choice, 4–5) | **letter** | **0.60** | **0.92** | **0.50** | 0.16 | – |
-| | sum | 0.32 | 4.01 | 1.12 | 0.47 | – |
-| | mean | 0.40 | 1.38 | 0.74 | 0.11 | – |
-| | sum-pmi | 0.49 | 2.15 | 0.81 | 0.31 | – |
-| | mean-pmi | 0.49 | 1.30 | 0.71 | 0.16 | – |
-| BoolQ (noul) | letter (yes/no logits) | 0.77 | 0.55 | 0.37 | 0.12 | – |
-| | sum / mean | 0.75 | 0.55 | 0.37 | 0.11 | – |
-| | **sum-pmi / mean-pmi** | **0.79** | **0.54** | **0.36** | 0.13 | – |
-| SST-5 (score, 5) | letter | 0.23 | 2.19 | 1.01 | 0.38 | 1.48 |
-| | **sum** | **0.33** | 1.60 | **0.78** | 0.10 | **1.08** |
-| | mean | 0.25 | 1.63 | 0.81 | 0.09 | 1.17 |
-| | sum-pmi | 0.25 | 1.60 | 0.82 | 0.21 | 1.12 |
-| | mean-pmi | 0.25 | **1.59** | 0.79 | **0.03** | 1.17 |
+| ARC-Challenge (choice, 4) | **0.612** | 0.344 | 0.376 | 0.400 | 0.372 | 0.25 |
+| ARC-Easy (choice, 4) | **0.800** | 0.688 | 0.628 | 0.602 | 0.576 | 0.25 |
+| CommonsenseQA (choice, 5) | **0.516** | 0.368 | 0.432 | 0.486 | 0.480 | 0.20 |
+| AG News (choice, 4) | **0.676** | 0.312 | 0.356 | 0.548 | 0.546 | 0.25 |
+| TREC coarse (choice, 6) | 0.548 | 0.332 | 0.208 | 0.548 | **0.584** | 0.17 |
+| Banking77 (choice, 77) | – | 0.078 | 0.022 | **0.234** | 0.208 | 0.013 |
+| BoolQ (noul) | **0.770** | 0.758 | 0.758 | 0.754 | 0.754 | 0.62 (majority) |
+| SST-5 (score, 5) | 0.214 | 0.256 | 0.178 | 0.304 | **0.306** | 0.20 |
 
-- No single zero-shot scorer wins: letter-logit is clearly best on knowledge MC (ARC) and worst on ordinal sentiment (SST-5). Summed likelihood shows the expected length and prior bias on ARC (NLL 4.0), and PMI recovers a lot of it.
-- SST-5 is weak for every scorer (≤ 0.33 acc against 0.2 chance). That's the case trained Score heads (M2) need to beat.
-- CPU cost is 1.4–5.5 s per example (PMI runs two forks). Rerun on GPU with n ≥ 500 before drawing finer conclusions.
+**Calibration:** test NLL and ECE-15, uncalibrated → per-bucket T fitted on the pooled calibration halves:
+
+| dataset | scorer | NLL | ECE-15 | AUROC |
+|---|---|---|---|---|
+| ARC-Challenge | letter | 0.945 → 0.954 | 0.071 → 0.071 | 0.73 |
+| | sum | 3.645 → **1.382** | 0.442 → **0.048** | 0.56 |
+| ARC-Easy | letter | 0.557 → 0.585 | 0.101 → 0.126 | 0.88 |
+| | sum | 1.415 → 1.123 | 0.135 → 0.309 | 0.68 |
+| CommonsenseQA | letter | 1.246 → 1.246 | 0.072 → 0.049 | 0.73 |
+| | sum-pmi | 1.458 → 1.284 | 0.193 → 0.096 | 0.68 |
+| AG News | letter | 0.873 → 0.835 | 0.150 → 0.124 | 0.74 |
+| | sum | 5.157 → **1.298** | 0.636 → 0.329 | 0.87 |
+| | sum-pmi | 1.876 → 1.069 | 0.340 → 0.081 | 0.72 |
+| TREC | sum | 6.892 → **1.794** | 0.374 → 0.095 | 0.73 |
+| | mean-pmi | 1.587 → 1.269 | 0.358 → 0.084 | 0.68 |
+| Banking77 | sum-pmi | 3.706 → 3.658 | 0.143 → 0.087 | 0.82 |
+| BoolQ | letter | 0.532 → 0.499 | 0.108 → **0.029** | 0.68 |
+| SST-5 | letter | 2.219 → 1.592 | 0.373 → 0.098 | 0.58 |
+| | mean-pmi | 1.586 → 1.541 | 0.083 → **0.025** | 0.59 |
+
+Fitted temperatures (pooled over datasets): letter choice/K≤5 1.12, K 6–20 1.08, score 6.34, noul 0.56. sum choice/K≤5 9.05, K 6–20 18.5, K>20 4.88. sum-pmi choice/K≤5 3.24, K>20 0.74. mean-pmi choice/K≤5 0.61, K>20 0.12. Every scorer gets noul T ≈ 0.57, meaning the yes/no logits are under-confident. The full table (every scorer, plus the log-K fit) is printed by the script.
+
+- **No zero-shot scorer wins everywhere.** Letter-logit is best on knowledge and topic MC and on BoolQ. PMI is best where label priors dominate (SST-5, TREC) and at large K (Banking77: 0.23, 18× chance).
+- **Temperature fixes badly scaled scorers:** summed likelihood drops from NLL 3.6–6.9 to 1.3–1.8, and BoolQ ECE drops from ~0.10 to 0.03 for every scorer. That meets the M3 acceptance on those cells (NLL down, accuracy unchanged, ECE < 0.05 for K ≤ 5).
+- **But one T per (type, K-bucket) is not dataset-agnostic for zero-shot scorers.** The choice/K≤5 bucket pools ARC, CSQA and AG News, whose best temperatures differ, so some cells get worse (letter on ARC-Easy: NLL +0.03; sum on ARC-Easy: ECE 0.14 → 0.31). Zero-shot score scales depend on the task's wording, not just K. Trained heads (M2) are what should make one temperature table transfer.
+- **T(log K) adds nothing** over the three buckets (NLL within ±0.02 on most cells, worse on TREC, the only K 6–20 data). Fitted slopes disagree in sign across scorers, which is the dataset confound again.
+- Throughput on one A4000 (fp32, one question per request): letter 0.10 s/example, likelihood 0.16–0.18, PMI 0.31–0.36; Banking77 0.64 / 1.26 (PMI).
+
+### M3 stress suite (zero-shot scorers)
+`scripts/stress_eval.py --limit 300`. Question and option-order invariance and fan-out are exact unit tests; these measure the rest.
+
+**K scaling:** Banking77 with the gold intent plus K−1 random distractors (accuracy / mean confidence, uncalibrated):
+
+| scorer | K = 2 | 5 | 10 | 20 | 40 | 77 |
+|---|---|---|---|---|---|---|
+| letter | **0.87** / 0.73 | **0.75** / 0.58 | **0.65** / 0.42 | 0.26 / 0.29 | – | – |
+| sum | 0.66 / 0.84 | 0.45 / 0.66 | 0.36 / 0.51 | 0.20 / 0.38 | 0.13 / 0.25 | 0.07 / 0.18 |
+| mean | 0.55 / 0.68 | 0.25 / 0.39 | 0.15 / 0.25 | 0.04 / 0.16 | 0.03 / 0.10 | 0.02 / 0.06 |
+| sum-pmi | 0.83 / 0.77 | 0.58 / 0.55 | 0.53 / 0.41 | **0.39** / 0.28 | **0.28** / 0.17 | **0.25** / 0.09 |
+| mean-pmi | 0.82 / 0.55 | 0.58 / 0.25 | 0.51 / 0.13 | 0.36 / 0.07 | 0.26 / 0.03 | 0.22 / 0.02 |
+
+Letter-logit collapses between K = 10 and 20 (long lettered lists), while sum-PMI degrades gracefully. Mean-length likelihood falls to chance from K = 20 on. Confidence falls with K for every scorer, and mean-PMI is badly under-confident at large K (0.02 confidence at 0.22 accuracy).
+
+**Empty-state prior** (state replaced by `""`; KL to uniform, lower is better; PMI is uniform by construction):
+
+| dataset | letter | sum | mean |
+|---|---|---|---|
+| ARC-Challenge | 0.13 | 0.83 | 0.11 |
+| BoolQ | 0.03 | 0.03 | 0.03 |
+| SST-5 | 0.90 | 0.21 | 0.03 |
+| AG News | 0.91 | 1.37 | 0.23 |
+| TREC | 0.34 | 1.13 | 0.12 |
+
+Letter and summed likelihood carry strong label priors on fixed-label tasks (on SST-5, AG News and TREC the empty-state input is the same for every example, so these are single distributions). Under an empty state BoolQ leans to "yes" on 73–74% of questions.
+
+**Length bias** (ARC-Challenge, 4 options): the argmax is the longest option 30% of the time for letter and 29% for sum-PMI, against 29% for gold (unbiased). Sum picks the longest 19% of the time (prefers short answers) and mean 38% (prefers long ones).
 
 M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
@@ -118,20 +179,28 @@ M1 design notes:
 - In the ARC and SST-5 converters, the question or review text is the state, so PMI's empty-state baseline is meaningful.
 
 ### Next steps
-- [ ] Recover the GPU (reboot / `nvidia-smi -r`), then on one GPU: finish the fp16 benchmark rows (4096 × 50+) and rerun `zero_shot_eval.py` at n ≥ 500
-- [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
-- [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)
-- [ ] M3: temperature fitting per (type, K-bucket) on the zero-shot scorers, plus the stress suite (permutation, K scaling, fan-out, empty state)
+- [x] ~~Recover the GPU~~ (moved to the A4000 box, Docker) and rerun `zero_shot_eval.py` at n ≥ 500
+- [x] Two-level fork (state → question cache → answers) for likelihood scoring
+- [x] M3 on the zero-shot scorers: temperature per (type, K-bucket) and T(log K), stress suite
+- [ ] Rerun `bench_fork.py` on the A4000 (Ampere, bf16), and choose the kernel per phase: fla for the state prefill, torch or `fused_recurrent` for short branches
+- [ ] M3: reliability plots; a per-dataset temperature as an oracle, to measure how much the pooled table loses
+- [ ] Use the two-level fork in `HeadScorer` too (the `<|read|>` branches still repeat the question prefix)
 - [ ] M2 (on hold): train `DecisionHeads` + LoRA so `HeadScorer` becomes the real model. Needs gradients through the forked cache, which in-place cache updates currently block (PLAN.md fallback A: per-row `[state, branch]` concatenation)
 
 ### Quickstart
+Docker (CUDA box; the repo is mounted, so edits need no rebuild):
 ```bash
-uv venv --python 3.12 .venv && uv pip install -e '.[dev]'
-.venv/bin/python -m pytest -q                                   # fast tests (tiny model)
-QWEN_RLCD_SLOW=1 .venv/bin/python -m pytest -q -s -k qwen35     # real Qwen3.5-0.8B-Base weights
-uv pip install -e '.[cuda]'                                      # CUDA only: fla DeltaNet kernels
-.venv/bin/python scripts/bench_fork.py --chunk-size 25           # benchmark (use a CUDA GPU)
-uv pip install -e '.[eval]' && .venv/bin/python scripts/zero_shot_eval.py --limit 200   # zero-shot baselines
+docker build -t qwen-rlcd .
+scripts/docker_run.sh pytest -q                                              # fast tests (tiny model)
+scripts/docker_run.sh env QWEN_RLCD_SLOW=1 pytest -q -s -k qwen35            # real Qwen3.5-0.8B-Base weights
+scripts/docker_run.sh python scripts/zero_shot_eval.py --limit 1000 --dump runs/zs.pt   # baselines + calibration
+scripts/docker_run.sh python scripts/stress_eval.py --limit 300              # stress suite
+GPU=1 scripts/docker_run.sh python scripts/bench_fork.py --chunk-size 25      # second GPU; GPU=none for CPU
+```
+Local venv (Mac/CPU):
+```bash
+uv venv --python 3.12 .venv && uv pip install -e '.[dev,eval]'
+.venv/bin/python -m pytest -q
 ```
 ```python
 from system_one.predict import predict

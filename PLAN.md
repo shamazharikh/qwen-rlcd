@@ -2,7 +2,7 @@
 
 Companion to `README.md` (the design brief). This plan turns that brief into a buildable project on **`Qwen/Qwen3.5-0.8B-Base`**, and records where the backbone forces changes to the brief.
 
-> **Status (2026-09-24):** M0 ✅ done (gradient-through-cache deferred with training). M1 🟡 inference slice done: typed `predict()`, zero-shot and `<|read|>`-head scorers, invariance tests, zero-shot baselines. M2 ⏸ on hold (inference-only scope). M3 has metrics only. M4 and M5 not started. Details and numbers are in README "Project status"; next steps are at the end of this file.
+> **Status (2026-09-25):** M0 ✅ done (gradient-through-cache deferred with training). M1 🟡 inference slice done: typed `predict()`, zero-shot and `<|read|>`-head scorers, invariance tests, two-level fork, zero-shot baselines on 8 datasets (GPU, n = 500 test). M2 ⏸ on hold (inference-only scope). M3 🟡 on the zero-shot scorers: temperature fitting, calibrated eval, stress suite. M4 and M5 not started. Dev env is Docker on 2× RTX A4000. Details and numbers are in README "Project status"; next steps are at the end of this file.
 
 ---
 
@@ -64,7 +64,7 @@ evals/ converters/ stress/ baselines/ run_eval.py
 tests/ test_fork_equivalence.py test_permutation.py test_padding.py test_cache_grad.py
 ```
 
-**As built (2026-09-24):** `fork.py`, `schema.py`, `templates.py`, `scorers.py` (backbone wrapper, zero-shot scorers, `DecisionHeads`; this takes the roles planned for `packing.py` and the inference half of `model.py`), `predict.py` (the typed API that `serve.py` will wrap), and `metrics.py`. Tests are `test_fork_equivalence.py` (padding and sibling cases included) and `test_predict.py` (permutation and fan-out invariance). Scripts are `bench_fork.py` and `zero_shot_eval.py` (dataset converters inline for now). Extras: `[cuda]` = flash-linear-attention, `[eval]` = datasets. `causal-conv1d` is not used (its build OOM-killed Colab; the torch conv path is cheap).
+**As built (2026-09-24):** `fork.py`, `schema.py`, `templates.py`, `scorers.py` (backbone wrapper, zero-shot scorers, `DecisionHeads`; this takes the roles planned for `packing.py` and the inference half of `model.py`), `predict.py` (the typed API that `serve.py` will wrap), and `metrics.py`. Tests are `test_fork_equivalence.py` (padding and sibling cases included) and `test_predict.py` (permutation and fan-out invariance). Scripts are `bench_fork.py` and `zero_shot_eval.py` (dataset converters inline for now). Extras: `[cuda]` = flash-linear-attention, `[eval]` = datasets. **Added 2026-09-25:** `calibrate.py`, `fork.extend_cache` (two-level fork, used by `LikelihoodScorer`), `tests/test_calibrate.py`, `scripts/stress_eval.py`, and `Dockerfile` + `scripts/docker_run.sh`. `zero_shot_eval.py` also does the calibrate/test split and plays the role planned for `run_eval.py`. `causal-conv1d` is not used (its build OOM-killed Colab; the torch conv path is cheap).
 
 ## 2. Milestone M0 — backbone spike (days 1–3) ⛳ go/no-go
 
@@ -151,6 +151,12 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 - ECE < 0.05 on the K ≤ 5 bucket after scaling.
 - Fan-out and permutation tests are exact (< 1e-3).
 
+**Outcome on the zero-shot scorers (🟡, 2026-09-25):** see README "M1/M3 results" and "M3 stress suite".
+- `calibrate.py` fits `TemperatureTable` (type × K-bucket) and `LogKTemperature` by NLL, fitted on the calibration halves of 8 datasets pooled per scorer. It is not yet stored in a checkpoint, since there is no trained checkpoint.
+- Temperature scaling lowers NLL on most cells without changing accuracy, dramatically for summed likelihood (3.6–6.9 → 1.3–1.8). ECE < 0.05 for K ≤ 5 is met on BoolQ, SST-5 (PMI) and ARC-C (sum), but not generally.
+- **Finding:** zero-shot score scales depend on the dataset's wording, not just K, so a pooled per-bucket T hurts some datasets (letter on ARC-Easy). T(log K) doesn't help. This is evidence that trained heads are needed for one temperature table to transfer.
+- Stress: K scaling (2–77), empty-state prior and length bias are measured. Permutation and fan-out are exact unit tests. Not done: near-duplicate options, catch-all removal, abstention, K ≥ 100, reliability plots, QWK/monotonicity for Score, the DeBERTa reference.
+
 ## 6. Milestone M4 — serving and efficiency (week 4–5)
 
 - `serve.py`: FastAPI with `POST /decide` using the README §5.2 schema and TypeSafe-shaped responses. Question IDs are never tokenized.
@@ -173,6 +179,7 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 |---|---|
 | fla backward doesn't support grads through `initial_state` | Fallback A: per-row `[state, branch]` concatenation (exact, costs O(branches × state)) for training only. Serving still forks. |
 | Expanded caches blow memory at K=200 with long states | **Confirmed** (2k × 50 OOMs on 11 GB). `expand` doesn't help, because the cache update concatenates and materialises the KV. **Mitigated** by `chunk_size`, which keeps memory flat in K. A two-level fork would also cut per-row cost. |
+| fla uses TF32 for fp32 dots on Ampere+ (and hardcodes it in the fused triangular solve) | **Confirmed** on the A4000: fork vs. sequential drifts to ~1e-3 relative. `fork.force_ieee_fp32()` restores 2.9e-5 for tests. Scoring keeps TF32 |
 | fla's DeltaNet kernel is slow on pre-Ampere GPUs | Measured on Turing: 64% of GPU time, and slower than the torch path for short branches. Choose the kernel per phase, and benchmark on Ampere+ before optimising. |
 | fla installed but running on CPU | transformers binds fla at import time for any device, and Triton then fails. Hide fla on CPU (`tests/conftest.py`, `Backbone.from_pretrained`). |
 | 0.8B too weak for hard knowledge tasks (MMLU/GPQA) | Expected. Judge it on calibration (confidence drops when out of depth), not raw accuracy. The same code scales to Qwen3.5-2B/4B/9B. |
@@ -191,9 +198,8 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 | 4–5 | M4 | Server + latency curves |
 | 6+ | M5 / RLCD v2 | Multimodal, soft-label training experiments |
 
-## Immediate next steps (updated 2026-09-24)
-1. Recover the dev box GPU (GPU 0 fell off the bus; CUDA init fails until a reboot or reset). Run one GPU job at a time.
-2. On GPU: finish the fp16 benchmark rows, and rerun `scripts/zero_shot_eval.py` at n ≥ 500 on more datasets (ARC-Easy, CommonsenseQA, AG News for large K).
-3. M3 on the zero-shot scorers: fit temperature per (type, K-bucket), plus reliability plots and the stress suite (permutation, K scaling, fan-out, empty state).
-4. Two-level fork (state → question cache → answers) and per-phase kernel choice.
-5. When training resumes (M2): pick the gradient path (fallback A or an out-of-place cache), then train `DecisionHeads` + LoRA.
+## Immediate next steps (updated 2026-09-25)
+1. Benchmark on the A4000: `bench_fork.py` in fp32/bf16, and the per-phase kernel choice (fla prefill, torch or `fused_recurrent` for short branches).
+2. Finish M3 on the zero-shot scorers: reliability plots, a per-dataset-T oracle to size the pooling loss, and the remaining stress tests (near-duplicates, catch-all removal, K ≥ 100).
+3. Two-level fork in `HeadScorer`; batch several requests' states into one prefill (M4 groundwork).
+4. When training resumes (M2): pick the gradient path (fallback A or an out-of-place cache), then train `DecisionHeads` + LoRA, and rerun the calibrated eval to check whether one temperature table transfers across datasets.
