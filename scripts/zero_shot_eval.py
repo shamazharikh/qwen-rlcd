@@ -1,7 +1,7 @@
 """Zero-shot baselines (README §7.7 #1–2) through the typed API, with temperature calibration (PLAN.md M3).
 
     python scripts/zero_shot_eval.py --limit 1000 --dump runs/zs.pt       # CUDA if available
-    python scripts/zero_shot_eval.py --from-dump runs/zs.pt               # refit calibration, no model
+    python scripts/zero_shot_eval.py --from-dump runs/zs.pt,runs/zs2.pt   # refit calibration, no model
     python scripts/zero_shot_eval.py --limit 20 --device cpu              # quick CPU check
 
 Each example becomes one single-question request (context in the state), so the numbers measure the
@@ -78,7 +78,7 @@ def ag_news(split="test"):
 
 
 def trec(split="test"):
-    ds = _load("CogComp/trec", split=split)
+    ds = _load("CogComp/trec", split=split, revision="refs/convert/parquet")  # the main branch is a loading script
     names = ds.features["coarse_label"].names
     for ex in ds:
         q = {"type": "choice", "instructions": "What kind of answer does this question ask for?", "criteria": TREC}
@@ -86,12 +86,12 @@ def trec(split="test"):
 
 
 def banking77(split="test"):
-    ds = _load("PolyAI/banking77", split=split)
-    names = ds.features["label"].names
+    ds = _load("mteb/banking77", split=split)  # parquet mirror; PolyAI/banking77 is a loading script
+    names = sorted(set(ds["label_text"]))
     criteria = {n: n.replace("_", " ").capitalize() for n in names}
     for ex in ds:
         q = {"type": "choice", "instructions": "What does the customer want help with?", "criteria": criteria}
-        yield {"state": ex["text"], "questions": {"q": q}}, names[ex["label"]]
+        yield {"state": ex["text"], "questions": {"q": q}}, ex["label_text"]
 
 
 DATASETS = {"arc_challenge": arc("ARC-Challenge"), "arc_easy": arc("ARC-Easy"), "csqa": csqa, "boolq": boolq,
@@ -158,12 +158,12 @@ def main():
     parser.add_argument("--limit", type=int, default=200, help="random examples per dataset (half calibrate, half test)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dump", help="save raw logits here (torch.save)")
-    parser.add_argument("--from-dump", help="load raw logits instead of running the model")
+    parser.add_argument("--from-dump", help="load raw logits instead of running the model (comma-separated files are merged)")
     parser.add_argument("--json", help="also write results here")
     args = parser.parse_args()
 
     if args.from_dump:
-        data = torch.load(args.from_dump)
+        data = {k: v for path in args.from_dump.split(",") for k, v in torch.load(path).items()}
     else:
         data = run_model(args)
         if args.dump:

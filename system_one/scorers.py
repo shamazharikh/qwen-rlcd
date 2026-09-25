@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from system_one import templates
-from system_one.fork import forward_branches_all, prefill_state
+from system_one.fork import extend_cache, forward_branches_all, prefill_state
 from system_one.schema import Request
 
 
@@ -57,6 +57,23 @@ class Backbone:
         state_ids = torch.tensor([self.encode(state_text)], device=self.device)
         cache = prefill_state(self.text_model, state_ids)
         return forward_branches_all(self.text_model, cache, state_ids.shape[1], branches, self.pad_id, self.chunk_size)
+
+    def run_grouped(
+        self, state_text: str, groups: list[tuple[list[int], list[list[int]]]]
+    ) -> list[tuple[torch.Tensor, list[torch.Tensor]]]:
+        """Two-level fork: prefill the state once, then per (prefix, answers) group run the prefix once
+        and fork its answers from the state + prefix cache. Returns (prefix hidden [P, d], answer hidden
+        states [len_i, d]) per group, the same states as running each prefix + answer as one branch."""
+        state_ids = torch.tensor([self.encode(state_text)], device=self.device)
+        cache, state_len = prefill_state(self.text_model, state_ids), state_ids.shape[1]
+        out = []
+        for prefix, answers in groups:
+            prefix_cache, prefix_hidden = extend_cache(self.text_model, cache, state_len, prefix)
+            hidden = forward_branches_all(
+                self.text_model, prefix_cache, state_len + len(prefix), answers, self.pad_id, self.chunk_size
+            )
+            out.append((prefix_hidden, hidden))
+        return out
 
     def token_id(self, text: str) -> int:
         ids = self.encode(text)
@@ -101,33 +118,35 @@ class LikelihoodScorer:
             raise ValueError("normalize must be 'sum' or 'mean'")
         self.backbone, self.normalize, self.pmi = backbone, normalize, pmi
 
-    def _branches(self, request: Request):
-        """Flattened (qid, prefix_len, ids) for every answer branch, in question then option order."""
-        items = []
-        for qid, q in request.questions.items():
-            prefix = self.backbone.encode(templates.branch_prefix(q))
-            for answer in templates.branch_answers(q):
-                items.append((qid, len(prefix), prefix + self.backbone.encode(answer)))
-        return items
+    def _groups(self, request: Request) -> list[tuple[str, list[int], list[list[int]]]]:
+        """(qid, question prefix ids, answer ids per option) in question then option order."""
+        encode = self.backbone.encode
+        return [
+            (qid, encode(templates.branch_prefix(q)), [encode(a) for a in templates.branch_answers(q)])
+            for qid, q in request.questions.items()
+        ]
 
-    def _answer_scores(self, state: str, items) -> torch.Tensor:
-        hidden = self.backbone.run(templates.render_state(state), [ids for _, _, ids in items])
+    def _answer_scores(self, state: str, groups) -> torch.Tensor:
+        # Two-level fork: each question prefix runs once, and only the answers are forked.
+        results = self.backbone.run_grouped(templates.render_state(state), [(p, a) for _, p, a in groups])
         scores = []
-        for (_, prefix_len, ids), h in zip(items, hidden):
-            # Hidden state at t predicts token t + 1; the answer span is ids[prefix_len:].
-            logprobs = torch.log_softmax(self.backbone.lm_head(h[prefix_len - 1 : -1]).float(), dim=-1)
-            targets = torch.tensor(ids[prefix_len:], device=logprobs.device)
-            token_lp = logprobs.gather(1, targets[:, None]).squeeze(1)
-            scores.append(token_lp.sum() if self.normalize == "sum" else token_lp.mean())
+        for (_, _, answers), (prefix_hidden, hidden) in zip(groups, results):
+            for ids, h in zip(answers, hidden):
+                # The state before answer token t: the last prefix position for t = 0, else answer position t - 1.
+                before = torch.cat([prefix_hidden[-1:], h[:-1]])
+                logprobs = torch.log_softmax(self.backbone.lm_head(before).float(), dim=-1)
+                targets = torch.tensor(ids, device=logprobs.device)
+                token_lp = logprobs.gather(1, targets[:, None]).squeeze(1)
+                scores.append(token_lp.sum() if self.normalize == "sum" else token_lp.mean())
         return torch.stack(scores)
 
     @torch.no_grad()
     def __call__(self, request: Request) -> dict[str, torch.Tensor]:
-        items = self._branches(request)
-        scores = self._answer_scores(request.state, items)
+        groups = self._groups(request)
+        scores = self._answer_scores(request.state, groups)
         if self.pmi:
-            scores = scores - self._answer_scores("", items)
-        return _group(request, [qid for qid, _, _ in items], scores)
+            scores = scores - self._answer_scores("", groups)
+        return _group(request, [qid for qid, _, answers in groups for _ in answers], scores)
 
 
 class DecisionHeads(nn.Module):

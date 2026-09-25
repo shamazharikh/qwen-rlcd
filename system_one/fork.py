@@ -39,6 +39,23 @@ def prefill_state(text_model, state_ids: torch.LongTensor) -> DynamicCache:
     return cache
 
 
+def extend_cache(
+    text_model, cache: DynamicCache, cache_len: int, ids: list[int]
+) -> tuple[DynamicCache, torch.Tensor]:
+    """Continue a copy of `cache` (batch 1, `cache_len` tokens) with `ids`; `cache` itself is untouched.
+
+    Returns the extended cache and the hidden states over `ids` ([len, d]). Used for two-level forks:
+    state → one cache per question → that question's answer branches, so the question text is run
+    once instead of once per answer.
+    """
+    extended = expand_cache(cache, 1)
+    device = text_model.embed_tokens.weight.device
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    position_ids = torch.arange(cache_len, cache_len + len(ids), device=device)[None]
+    out = text_model(input_ids=input_ids, position_ids=position_ids, past_key_values=extended, use_cache=True)
+    return extended, out.last_hidden_state[0]
+
+
 def _repeat(value, n: int, batch_size: int):
     if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
         return value.repeat_interleave(n, dim=0)
