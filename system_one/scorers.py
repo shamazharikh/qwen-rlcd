@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from system_one import templates
-from system_one.fork import forward_branches_all, prefill_state
+from system_one.fork import forward_branches_all, forward_question_tree, prefill_state
 from system_one.schema import Request
 
 
@@ -57,6 +57,16 @@ class Backbone:
         state_ids = torch.tensor([self.encode(state_text)], device=self.device)
         cache = prefill_state(self.text_model, state_ids)
         return forward_branches_all(self.text_model, cache, state_ids.shape[1], branches, self.pad_id, self.chunk_size)
+
+    def run_tree(
+        self, state_text: str, questions: list[tuple[list[int], list[list[int]]]]
+    ) -> list[tuple[torch.Tensor, list[torch.Tensor]]]:
+        """Two-level fork: the state is prefilled once and each question prefix once, not once per option."""
+        state_ids = torch.tensor([self.encode(state_text)], device=self.device)
+        cache = prefill_state(self.text_model, state_ids)
+        return forward_question_tree(
+            self.text_model, cache, state_ids.shape[1], questions, self.pad_id, self.chunk_size
+        )
 
     def token_id(self, text: str) -> int:
         ids = self.encode(text)
@@ -101,33 +111,36 @@ class LikelihoodScorer:
             raise ValueError("normalize must be 'sum' or 'mean'")
         self.backbone, self.normalize, self.pmi = backbone, normalize, pmi
 
-    def _branches(self, request: Request):
-        """Flattened (qid, prefix_len, ids) for every answer branch, in question then option order."""
+    def _questions(self, request: Request):
+        """(qid, prefix_ids, [answer_ids]) per question, answers in `templates.option_keys` order."""
         items = []
         for qid, q in request.questions.items():
             prefix = self.backbone.encode(templates.branch_prefix(q))
-            for answer in templates.branch_answers(q):
-                items.append((qid, len(prefix), prefix + self.backbone.encode(answer)))
+            items.append((qid, prefix, [self.backbone.encode(a) for a in templates.branch_answers(q)]))
         return items
 
     def _answer_scores(self, state: str, items) -> torch.Tensor:
-        hidden = self.backbone.run(templates.render_state(state), [ids for _, _, ids in items])
+        tree = self.backbone.run_tree(templates.render_state(state), [(p, a) for _, p, a in items])
         scores = []
-        for (_, prefix_len, ids), h in zip(items, hidden):
-            # Hidden state at t predicts token t + 1; the answer span is ids[prefix_len:].
-            logprobs = torch.log_softmax(self.backbone.lm_head(h[prefix_len - 1 : -1]).float(), dim=-1)
-            targets = torch.tensor(ids[prefix_len:], device=logprobs.device)
-            token_lp = logprobs.gather(1, targets[:, None]).squeeze(1)
-            scores.append(token_lp.sum() if self.normalize == "sum" else token_lp.mean())
+        for (_, _, answers), (prefix_hidden, answer_hidden) in zip(items, tree):
+            for ids, hidden in zip(answers, answer_hidden):
+                # Hidden state at t predicts token t + 1, so the answer's first token is predicted by
+                # the last prefix position and its last token's own hidden state is not needed.
+                before = torch.cat([prefix_hidden[-1:], hidden[:-1]])
+                logprobs = torch.log_softmax(self.backbone.lm_head(before).float(), dim=-1)
+                targets = torch.tensor(ids, device=logprobs.device)
+                token_lp = logprobs.gather(1, targets[:, None]).squeeze(1)
+                scores.append(token_lp.sum() if self.normalize == "sum" else token_lp.mean())
         return torch.stack(scores)
 
     @torch.no_grad()
     def __call__(self, request: Request) -> dict[str, torch.Tensor]:
-        items = self._branches(request)
+        items = self._questions(request)
+        qids = [qid for qid, _, answers in items for _ in answers]
         scores = self._answer_scores(request.state, items)
         if self.pmi:
             scores = scores - self._answer_scores("", items)
-        return _group(request, [qid for qid, _, _ in items], scores)
+        return _group(request, qids, scores)
 
 
 class DecisionHeads(nn.Module):
@@ -158,15 +171,15 @@ class HeadScorer:
 
     @torch.no_grad()
     def __call__(self, request: Request) -> dict[str, torch.Tensor]:
-        qids, branches = [], []
+        qids, questions = [], []
         for qid, q in request.questions.items():
             prefix = self.backbone.encode(templates.branch_prefix(q))
             answers = [""] if q.type == "noul" else templates.branch_answers(q)
-            for answer in answers:
-                qids.append(qid)
-                branches.append(prefix + (self.backbone.encode(answer) if answer else []) + [self.read_id])
-        hidden = self.backbone.run(templates.render_state(request.state), branches)
-        reads = torch.stack([h[-1] for h in hidden]).to(self.heads.option_head.weight.dtype)
+            # The read token ends every answer branch; a noul question reads right after its prefix.
+            questions.append((prefix, [(self.backbone.encode(a) if a else []) + [self.read_id] for a in answers]))
+            qids.extend([qid] * len(answers))
+        tree = self.backbone.run_tree(templates.render_state(request.state), questions)
+        reads = torch.stack([h[-1] for _, answers in tree for h in answers]).to(self.heads.option_head.weight.dtype)
         option_logits = self.heads.option_head(reads).squeeze(-1).float()
         noul_logits = self.heads.noul_head(reads).squeeze(-1).float()
         out = _group(request, qids, option_logits)
