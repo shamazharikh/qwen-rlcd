@@ -13,7 +13,7 @@ The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md
 | Milestone | Status |
 |---|---|
 | **M0** backbone spike (prefix fork) | ✅ Done. Fork = full forward on real weights (CPU, CUDA + fla, fp32/fp16); 8–19× faster than one forward per branch; chunked branches bound memory. Gradient-through-cache check deferred until training resumes. |
-| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 3 datasets (CPU, n = 100). Remaining: GPU numbers at larger n, two-level fork. |
+| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 3 datasets (CPU, n = 100), two-level fork with a per-question cost switch. Remaining: GPU numbers at larger n. |
 | **M2** training (LoRA + heads) | ⏸ On hold |
 | **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
 | **M4** serving / **M5** multimodal | Not started |
@@ -32,7 +32,7 @@ Branches are isolated in every layer type by construction, and results can't dep
 ### What's built (M0)
 | Path | What it does |
 |---|---|
-| `system_one/fork.py` | `prefill_state`, `expand_cache`, `forward_branches`, `fork_forward` (optional `chunk_size` to bound memory), plus a `sequential_reads` reference (one uncached full forward per branch) |
+| `system_one/fork.py` | `prefill_state`, `expand_cache`, `forward_branches`, `fork_forward` (optional `chunk_size` to bound memory), `extend_cache` / `forward_question_tree` for the two-level fork, plus a `sequential_reads` reference (one uncached full forward per branch) |
 | `tests/test_fork_equivalence.py` | Fork vs. sequential equivalence on a tiny random hybrid model and on real 0.8B weights; covers padding and sibling independence, conv-kernel and delta-rule chunk edge cases, source-cache immutability, and sensitivity checks that must fail when DeltaNet state isn't forked. Runs on CUDA when available. |
 | `scripts/bench_fork.py` | Latency and peak memory: fork vs. one forward per branch, across state lengths and branch counts |
 | `notebooks/m0_gpu_checks.ipynb` | Colab notebook: installs `flash-linear-attention`, runs the tests on GPU, then the benchmark |
@@ -117,9 +117,25 @@ M1 design notes:
 - The invariance tests are sensitive: rendering options in caller order makes all four scorers fail them (1e-1 to 3e-4 diffs).
 - In the ARC and SST-5 converters, the question or review text is the state, so PMI's empty-state baseline is meaningful.
 
+### Two-level fork (state → question cache → answers)
+`fork.forward_question_tree` extends the state cache with one question prefix (batch 1, unpadded, so no pad tokens enter the KV or the recurrent state), then forks *that* cache across the question's answers. Branch tokens per question fall from `K · (prefix + answer)` to `prefix + K · answer`. `scorers.Backbone.run_tree` exposes it, and the likelihood and head scorers use it.
+
+Equivalence: concatenating the returned prefix and answer hidden states reproduces the one-level branch to **1.1e-4** on real weights (tolerance 1e-3) and ~1e-6 on the tiny model, including empty prefixes, sub-conv-kernel lengths, chunk-boundary crossings and chunked answers.
+
+**It is not always faster.** `scripts/bench_two_level.py` on CPU (0.8B, fp32, 256-token state, 12-token answers, median of 3):
+
+| prefix tokens | options | one-level ms | two-level ms | speedup | branch tokens 1L → 2L |
+|---|---|---|---|---|---|
+| 32 | 5 | 5814 | 9266 | 0.6× | 220 → 92 |
+| 32 | 20 | 33998 | 15540 | **2.2×** | 880 → 272 |
+| 128 | 5 | 5960 | 7835 | 0.8× | 700 → 188 |
+| 128 | 20 | 93925 | 15144 | **6.2×** | 2800 → 368 |
+
+One extra forward costs a near-fixed amount whatever its length, so the second level only pays once it saves enough recomputation. `forward_question_tree` therefore switches per question: it forks twice when `(K − 1) · len(prefix) ≥ min_prefix_saving` (default 600 tokens, fitted to the rows above) and runs one-level otherwise, returning identical values either way. Small-K benchmarks like ARC (K = 4–5) keep the one-level path. Re-fit the threshold on GPU.
+
 ### Next steps
-- [ ] Recover the GPU (reboot / `nvidia-smi -r`), then on one GPU: finish the fp16 benchmark rows (4096 × 50+) and rerun `zero_shot_eval.py` at n ≥ 500
-- [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
+- [ ] Recover the GPU (reboot / `nvidia-smi -r`), then on one GPU: finish the fp16 benchmark rows (4096 × 50+), rerun `zero_shot_eval.py` at n ≥ 500, and re-fit `MIN_PREFIX_SAVING` with `scripts/bench_two_level.py`
+- [ ] Large-K check for the two-level fork (Banking77 / CLINC150, K = 77–150), where it should win most
 - [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)
 - [ ] M3: temperature fitting per (type, K-bucket) on the zero-shot scorers, plus the stress suite (permutation, K scaling, fan-out, empty state)
 - [ ] M2 (on hold): train `DecisionHeads` + LoRA so `HeadScorer` becomes the real model. Needs gradients through the forked cache, which in-place cache updates currently block (PLAN.md fallback A: per-row `[state, branch]` concatenation)

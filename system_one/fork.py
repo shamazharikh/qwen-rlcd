@@ -133,6 +133,13 @@ def extend_cache(
     return extended, out.last_hidden_state[0]
 
 
+# Tokens of prefix recomputation that must be saved before the extra sequential prefix forward pays
+# for itself. Measured with `scripts/bench_two_level.py` on CPU (0.8B, 256-token state, 12-token
+# answers): two-level was 2.2-6.2x faster at K=20 (saving 608-2432 tokens) but 0.6-0.8x at K=5
+# (saving 128-512), because one more forward costs a near-fixed amount whatever its length.
+MIN_PREFIX_SAVING = 600
+
+
 def forward_question_tree(
     text_model,
     state_cache: DynamicCache,
@@ -140,6 +147,7 @@ def forward_question_tree(
     questions: list[tuple[list[int], list[list[int]]]],
     pad_id: int,
     chunk_size: int | None = None,
+    min_prefix_saving: int = MIN_PREFIX_SAVING,
 ) -> list[tuple[torch.Tensor, list[torch.Tensor]]]:
     """Two-level fork: state → one cache per question prefix → that question's answer branches.
 
@@ -149,16 +157,26 @@ def forward_question_tree(
 
     The point is cost: a one-level fork re-runs the question prefix inside every option branch, so it
     spends `K · (len_prefix + len_answer)` tokens per question, while this spends
-    `len_prefix + K · len_answer` — the saving grows with K and with prefix length (PLAN.md §6).
+    `len_prefix + K · len_answer` (PLAN.md §6). That only pays once the saved recomputation,
+    `(K - 1) · len_prefix` tokens, outweighs one extra forward pass, so a question below
+    `min_prefix_saving` runs one-level instead; either way the returned values are the same. Pass 0
+    to always fork twice, or a huge value to never do so.
     """
     results = []
     for prefix_ids, answers in questions:
         if not answers:
             raise ValueError("each question needs at least one answer branch")
-        cache, prefix_hidden = extend_cache(text_model, state_cache, state_len, prefix_ids)
-        answer_hidden = forward_branches_all(
-            text_model, cache, state_len + len(prefix_ids), answers, pad_id, chunk_size
-        )
+        if (len(answers) - 1) * len(prefix_ids) >= min_prefix_saving:
+            cache, prefix_hidden = extend_cache(text_model, state_cache, state_len, prefix_ids)
+            answer_hidden = forward_branches_all(
+                text_model, cache, state_len + len(prefix_ids), answers, pad_id, chunk_size
+            )
+        else:
+            flat = forward_branches_all(
+                text_model, state_cache, state_len, [prefix_ids + a for a in answers], pad_id, chunk_size
+            )
+            prefix_hidden = flat[0][: len(prefix_ids)]
+            answer_hidden = [h[len(prefix_ids) :] for h in flat]
         results.append((prefix_hidden, answer_hidden))
     return results
 
