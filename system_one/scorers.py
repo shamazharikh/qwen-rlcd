@@ -19,6 +19,7 @@ from torch import nn
 
 from system_one import templates
 from system_one.fork import forward_branches_all, prefill_state
+from system_one.kernels import disable_fla_tf32
 from system_one.schema import Request
 
 
@@ -35,6 +36,8 @@ class Backbone:
         if str(device) == "cpu" and "transformers.models.qwen3_5.modeling_qwen3_5" not in sys.modules:
             # transformers binds the DeltaNet kernel at import and picks fla (CUDA-only) whenever installed.
             sys.modules.setdefault("fla", None)
+        elif dtype == torch.float32:
+            disable_fla_tf32()  # fp32 should mean fp32: TF32 in fla moves reads by ~2e-2 on Ampere+
         from transformers import AutoModelForImageTextToText, AutoTokenizer
 
         model = AutoModelForImageTextToText.from_pretrained(repo, dtype=dtype).eval().to(device)

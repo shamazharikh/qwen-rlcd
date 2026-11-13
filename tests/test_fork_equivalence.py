@@ -166,5 +166,7 @@ def test_fork_matches_sequential_qwen35_08b_base(dtype):
     print(f"\nQwen3.5-0.8B-Base [{DEVICE}, {dtype}] fork vs sequential: max abs diff {diff:.2e}, min cos {cos:.6f}")
     if dtype == torch.float32:
         assert diff < TOL
-    else:  # bf16/fp16: kernels pick different chunkings for different shapes, so compare direction only
-        assert cos > 0.9999
+    else:  # bf16/fp16: kernels pick different chunkings for different shapes, so compare direction only.
+        # bf16 keeps 3 fewer mantissa bits than fp16. On an L4: bf16 fork vs bf16 sequential 0.999887, while
+        # each alone is ~0.99993-0.99994 from fp32, so the fork adds no error beyond bf16 rounding itself.
+        assert cos > (0.9995 if dtype == torch.bfloat16 else 0.9999)

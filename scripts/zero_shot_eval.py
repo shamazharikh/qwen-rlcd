@@ -25,11 +25,38 @@ from system_one.templates import option_keys
 SST5_LEVELS = ["Very negative", "Negative", "Neutral", "Positive", "Very positive"]
 
 
-def arc(split="test"):
-    for ex in load_dataset("allenai/ai2_arc", "ARC-Challenge", split=split):
-        criteria = dict(zip(ex["choices"]["label"], ex["choices"]["text"]))
-        q = {"type": "choice", "instructions": "Which option correctly answers the question?", "criteria": criteria}
-        yield {"state": ex["question"], "questions": {"q": q}}, ex["answerKey"]
+def _mcq(question, labels, texts, answer):
+    q = {"type": "choice", "instructions": "Which option correctly answers the question?", "criteria": dict(zip(labels, texts))}
+    return {"state": question, "questions": {"q": q}}, answer
+
+
+def arc(split="test", subset="ARC-Challenge"):
+    for ex in load_dataset("allenai/ai2_arc", subset, split=split):
+        yield _mcq(ex["question"], ex["choices"]["label"], ex["choices"]["text"], ex["answerKey"])
+
+
+def arc_easy(split="test"):
+    yield from arc(split, "ARC-Easy")
+
+
+def commonsense_qa(split="validation"):  # test split has no labels
+    for ex in load_dataset("tau/commonsense_qa", split=split):
+        yield _mcq(ex["question"], ex["choices"]["label"], ex["choices"]["text"], ex["answerKey"])
+
+
+AG_NEWS_TOPICS = {
+    "world": "World news and international affairs",
+    "sports": "Sports",
+    "business": "Business and economy",
+    "scitech": "Science and technology",
+}
+
+
+def ag_news(split="test"):
+    keys = list(AG_NEWS_TOPICS)  # dataset label order: World, Sports, Business, Sci/Tech
+    for ex in load_dataset("fancyzhx/ag_news", split=split):
+        q = {"type": "choice", "instructions": "What is the topic of this news article?", "criteria": AG_NEWS_TOPICS}
+        yield {"state": ex["text"], "questions": {"q": q}}, keys[ex["label"]]
 
 
 def boolq(split="validation"):
@@ -44,7 +71,14 @@ def sst5(split="test"):
         yield {"state": ex["text"], "questions": {"q": q}}, ex["label"]
 
 
-DATASETS = {"arc_challenge": arc, "boolq": boolq, "sst5": sst5}
+DATASETS = {
+    "arc_challenge": arc,
+    "arc_easy": arc_easy,
+    "commonsense_qa": commonsense_qa,
+    "ag_news": ag_news,
+    "boolq": boolq,
+    "sst5": sst5,
+}
 
 
 def evaluate(examples, scorer):

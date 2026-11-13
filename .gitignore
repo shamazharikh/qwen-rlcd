@@ -8,3 +8,4 @@ wandb/
 *.safetensors
 .claude/
 *.egg-info/
+.scratch/

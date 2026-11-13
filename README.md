@@ -18,7 +18,7 @@ The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md
 | **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
 | **M4** serving / **M5** multimodal | Not started |
 
-**Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box.
+**Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box. GPU runs since 2026-11-13 use an NVIDIA L4 (24 GB, sm89) in a Kubernetes dev pod: `pip install uv && uv venv .venv && uv pip install -e '.[dev,eval,cuda]'`.
 
 ### Key design change: prefix-fork instead of a tree mask
 Qwen3.5-0.8B is a hybrid model: 24 layers = **18 Gated DeltaNet (linear attention) + 6 gated full attention**. A tree attention mask (§2.2, §5.4 below) cannot isolate sibling branches inside recurrent layers, so this repo uses **prefix-fork execution** instead:
@@ -67,7 +67,34 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | 4096 | 10 | 895 | 553 | 4.70 | 9976 | 11.2× |
 | 4096 | 200 | 3196 | – | 7.39 | – | – |
 
+### M0 results: GPU (2026-11-13, NVIDIA L4 24 GB, sm89, fla 0.6.0, torch 2.15 / CUDA 13.2, no `causal-conv1d`)
+All tests pass, fast and real-weight, once fla's TF32 is turned off for fp32 (`system_one/kernels.py`, see findings).
+
+| Check | Result |
+|---|---|
+| **Qwen3.5-0.8B-Base, fork vs. sequential, fp32, fla (IEEE)** | max abs diff **2.1e-5** (tolerance 1e-3), min cos 1.000000 |
+| Same, fla with its default TF32 | max abs diff 2.0e-2 (fails) |
+| Same, bf16 | min cos 0.999887. bf16 fork and bf16 sequential are each 0.99993–0.99994 from fp32, so the fork adds no error beyond bf16 rounding |
+
+Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches). The fp32 column uses Triton's default TF32, since the script loads the model directly rather than through `Backbone`.
+
+| state tokens | branches | fork ms bf16 | fork ms fp32 | fork peak GiB bf16 | sequential ms bf16 | speedup (bf16) |
+|---|---|---|---|---|---|---|
+| 512 | 1 | 100 | 118 | 1.48 | 46 | 0.5× |
+| 512 | 10 | 97 | 135 | 1.74 | 457 | 4.7× |
+| 512 | 50 | 150 | 343 | 2.21 | 2332 | 15.6× |
+| 512 | 100 | 256 | 617 | 2.21 | – | – |
+| 2048 | 1 | 137 | 363 | 1.60 | 95 | 0.7× |
+| 2048 | 10 | 139 | 402 | 2.05 | 958 | 6.9× |
+| 2048 | 50 | 247 | 695 | 2.96 | 4805 | 19.4× |
+| 2048 | 100 | 403 | 1099 | 2.96 | – | – |
+
+Unlike Turing, bf16 here is 2–3× faster than fp32 for 50+ branches. With 1 branch the fork is slower than a plain forward, because it pays for a separate prefill.
+
 ### M0 findings
+- **On Ampere+ (sm ≥ 8), fla's "fp32" is really TF32.** Triton runs fp32 `tl.dot` as TF32 by default, and fla 0.6 also hard-codes `input_precision='tf32'` in the gated-delta-rule `solve_tril` kernel (`SOLVE_TRIL_DOT_PRECISION`), so `TRITON_F32_DEFAULT=ieee` alone isn't enough. Together they put fp32 fork and sequential reads 2e-2 apart on an L4. `system_one.kernels.disable_fla_tf32()` sets the env vars and patches that constant. `Backbone.from_pretrained` calls it for fp32 on CUDA, and so does `tests/conftest.py`. The constant has to be patched after `fla.ops` is imported, because faking an sm < 8 capability at import makes Triton build kernels for the wrong arch. Turing never showed this, since it has no TF32.
+- **fla 0.5.2 doesn't import on Triton 3.9** (autotune key `BT` error). transformers then silently falls back to the torch kernels, so a passing fp32 test can mean fla never ran. Check `fla.__version__` imports cleanly before trusting GPU numbers.
+- **fla 0.6.0's `fused_recurrent_gated_delta_rule` with an `initial_state` from `chunk_gated_delta_rule` returned NaN** in a standalone kernel check (S ≥ 64). The cause hasn't been looked into; it may be a state-layout mismatch, since 0.6 kernels have a `STATE_V_FIRST` flag. transformers only calls it for single-token decode, which the fork never does, but keep it in mind before using `fused_recurrent` for short branches.
 - **`DynamicCache.batch_repeat_interleave` can't fork this model** (transformers 5.17). `LinearAttentionLayer` has no such method, and `LinearAttentionAndFullAttentionLayer` inherits `DynamicLayer`'s, which repeats only keys and values. Hence the custom `expand_cache`.
 - **The cache updates DeltaNet state in place** (`copy_`), so backward through a forked cache fails. This only matters for training, which is out of scope for now.
 - **Tiny random models barely use DeltaNet state.** Zeroing it moves reads by only ~1e-4, so tiny-model tests use a 1e-5 tolerance to stay sensitive.
