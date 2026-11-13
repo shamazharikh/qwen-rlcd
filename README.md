@@ -153,6 +153,37 @@ Unlike Turing, bf16 here is 2–3× faster than fp32 for 50+ branches. With 1 br
 - Local cost on the L4 in fp32: 0.09–0.12 s/example (0.20–0.23 s for PMI, which runs two forks). Gemini: 0.09 s/example wall time with 8 concurrent requests.
 - The earlier CPU n = 100 numbers are in git history (`8270d63`).
 
+### Larger backbones, vLLM and Gemini (n = 500, 2026-11-13)
+Same 500 examples per dataset (seed 0) for every column. Cells are accuracy / NLL / ECE-15. Our models use the `letter` scorer (the best or within 0.01 of the best local scorer, except SST-5 and BoolQ, noted below). 9B ran in bf16 on an L4, and 35B-A3B in FP8 (`quantization="fp8"`, the default) on an L40S. vLLM 0.32 `POST /v1/systemone` served the same Base checkpoints (bf16, L4), one request at a time.
+
+| dataset | 0.8B | 9B | 35B-A3B (FP8) | vLLM 0.8B | vLLM 9B | Gemini Decision 1 |
+|---|---|---|---|---|---|---|
+| ARC-Challenge | 0.612 / 0.95 / 0.053 | 0.928 / 0.22 / 0.040 | **0.948** / 0.20 / 0.028 | 0.462 / 1.29 / 0.164 | 0.928 / 0.21 / 0.029 | *0.968 / 0.13 / 0.038* |
+| ARC-Easy | 0.756 / 0.62 / 0.097 | 0.982 / 0.09 / 0.048 | 0.982 / 0.09 / 0.043 | 0.626 / 0.92 / 0.067 | **0.984** / 0.06 / 0.019 | *0.990 / 0.06 / 0.035* |
+| CommonsenseQA | 0.496 / 1.25 / 0.056 | 0.816 / 0.53 / 0.059 | 0.812 / 0.54 / 0.042 | 0.416 / 1.45 / 0.105 | **0.822** / 0.49 / 0.054 | *0.860 / 0.39 / 0.093* |
+| AG News | 0.654 / 0.86 / 0.136 | **0.870** / 0.42 / 0.064 | 0.822 / 0.49 / 0.073 | 0.738 / 0.72 / 0.136 | 0.860 / 0.52 / 0.101 | *0.890 / 0.32 / 0.020* |
+| BoolQ | 0.770 / 0.54 / 0.107 | 0.886 / 0.27 / 0.028 | **0.894** / 0.26 / 0.035 | 0.762 / 0.48 / 0.044 | 0.886 / 0.29 / 0.024 | *0.926 / 0.22 / 0.021* |
+| SST-5 (MAE) | 0.202 / 2.22 / 0.392 (1.44) | 0.480 / 1.19 / 0.153 (0.57) | 0.418 / 1.45 / 0.267 (0.62) | 0.238 / 1.91 / 0.264 (1.24) | **0.500** / 1.11 / 0.075 (0.58) | *0.542 / 0.95 / 0.091 (0.50)* |
+| s/example | 0.09–0.10 (fp32) | 0.17–0.19 | 0.35–0.57 | 0.03–0.04 | 0.09–0.11 | 0.09 (8 concurrent) |
+
+Other local scorers that beat `letter`: SST-5 sum-pmi 0.306 (0.8B) / 0.484 (9B), sum 0.500 (A3B); BoolQ sum 0.894 (9B) / 0.898 (A3B).
+
+- **9B gets within 0.01–0.06 of Gemini zero-shot** and is mostly well calibrated (ECE 0.03–0.06, except SST-5). It's the practical pick: 35B-A3B (FP8) beats it only on ARC-Challenge (+0.02, inside the ±0.04 CI), trails on AG News (−0.05) and SST-5 letter, and runs 2–3× slower here (eager FP8 MoE in transformers, no fused kernels; 40 layers vs 32).
+- **vLLM `/v1/systemone` is the same idea as `letter`** (one read of a single label token, softmax over labels) with a different prompt: chat template with thinking off, options as `A: name - description`. At 9B the two are tied on every dataset (±0.02), with vLLM slightly better calibrated. At 0.8B ours wins on knowledge MC by 0.08–0.15 and vLLM wins on AG News by 0.08: the small model is prompt-sensitive, the 9B isn't.
+- **vLLM is ~2× faster per single-question request** (9B: 0.1 s vs 0.18 s, both bf16): CUDA graphs and fused kernels vs our eager path. These runs have one question per state, so they don't exercise the fork's advantage (one state prefill shared by many questions), nor vLLM's limits (64 questions, 26 options, 10 levels, one read per question). A many-questions-per-state benchmark is the next comparison.
+- Benchmarks (`bench_fork.py --chunk-size 10`, 24-token branches): 9B bf16 on L4, 2048 × 50 branches in 1.47 s at 16.4 GiB, 8.7× faster than sequential at 10 branches. 35B-A3B FP8 on L40S, 2048 × 50 in 1.02 s at 33.7 GiB, 5.1× at 10 branches.
+
+**FP8 and MoE make reads depend on batch shape.** On real 35B-A3B weights (FP8), fork vs sequential reads differ by 1 − cos = 6.1e-3, against ~1e-4 for the dense models in bf16. A diagnostic (router top-8 at each read token, L40S) shows the fork is not the cause:
+
+| comparison (A3B, FP8) | 1 − cos | layers with an expert flip (of 40) |
+|---|---|---|
+| batched fork vs sequential | 2.5e-3 – 6.1e-3 | 11–14 |
+| single-branch fork vs sequential (cache only) | 1.0e-3 – 3.5e-3 | 6–16 |
+| batched vs single-branch fork (batch shape only) | 2.1e-3 – 4.2e-3 | 12–18 |
+| sequential vs sequential | 0 | 0 |
+
+Changing only the batch shape moves reads as much as the fork does, and identical shapes are bit-exact. The source is FP8: dense models in FP8 already drift 17–18× more than in bf16 (fork vs sequential 1 − cos: 0.8B 2.7e-3, 9B 1.7e-3, vs 1.5e-4 / 1.0e-4 in bf16), because quantizing activations to coarse steps turns rounding-level differences into step-sized jumps. MoE then flips about one of the top-8 experts in a third of the layers. Next-token distributions move by 0.04–0.09 total variation, enough to flip near-tied answers. The real-weight test therefore checks MoE models against their own batch-shape noise (fork within 3× of batched-vs-single-branch fork) instead of a fixed cosine. For batch-invariant FP8/MoE answers, a deterministic serving mode would be needed (vLLM has `VLLM_BATCH_INVARIANT=1`).
+
 M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
 - `<|read|>` gets id 248077. The tokenizer uses 248,077 ids but the embedding has 248,320 rows, so no resize is needed.
@@ -161,7 +192,10 @@ M1 design notes:
 
 ### Next steps
 - [x] GPU zero-shot run at n = 500 on 6 datasets (L4), plus the Gemini Decisions API reference
-- [ ] Large-K choice datasets (Banking77 / DBpedia-14 / CLINC150) for the K-scaling test, local and Gemini
+- [ ] Large-K choice datasets (Banking77 / DBpedia-14 / CLINC150) for the K-scaling test, local, vLLM and Gemini
+- [x] Qwen3.5-9B and 35B-A3B (FP8) backbones, and vLLM `/v1/systemone` comparison (n = 500)
+- [ ] Many-questions-per-state benchmark: fork vs vLLM `/v1/systemone` vs Gemini, latency vs #questions (README §7.8)
+- [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B
 - [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
 - [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)
 - [ ] M3: temperature fitting per (type, K-bucket) on the zero-shot scorers, plus the stress suite (permutation, K scaling, fan-out, empty state)

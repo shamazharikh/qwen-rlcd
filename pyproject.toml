@@ -8,7 +8,7 @@ dependencies = ["torch>=2.5", "transformers>=5.17", "accelerate", "numpy"]
 dev = ["pytest"]
 eval = ["datasets"]
 cuda = ["flash-linear-attention"]
-fp8 = ["kernels>=0.17.2,<0.18"]  # FP8 matmul kernels for quantization="fp8" (35B-A3B default)
+fp8 = ["kernels>=0.17.2,<0.19"]  # FP8 matmul kernels for quantization="fp8" (35B-A3B default)
 
 [build-system]
 requires = ["setuptools>=61"]

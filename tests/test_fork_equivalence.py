@@ -169,10 +169,20 @@ def test_fork_matches_sequential_qwen35_real(dtype):
     with torch.no_grad():
         forked = fork_forward(text_model, state_ids, branches, pad_id).float()
         reference = sequential_reads(text_model, state_ids, branches).float()
+        # Same fork, one branch per batch: differs from `forked` only in batch shape (the model's own noise floor).
+        single = fork_forward(text_model, state_ids, branches, pad_id, chunk_size=1).float()
     diff = (forked - reference).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(forked, reference, dim=-1).min().item()
     print(f"\n{REAL_REPO} [{DEVICE}, {dtype}] fork vs sequential: max abs diff {diff:.2e}, min cos {cos:.6f}")
-    if dtype == torch.float32:
+    noise = 1 - torch.nn.functional.cosine_similarity(forked, single, dim=-1).min().item()
+    print(f"    batch-shape noise floor (batched vs single-branch fork): 1 - cos = {noise:.2e}")
+    if getattr(text_model.config, "num_experts", 0):
+        # MoE (35B-A3B, FP8 by default): top-8-of-256 routing amplifies batch-shape rounding into expert flips
+        # (~1 expert in a third of the layers), so a fixed cosine bound is meaningless. Measured on an L40S:
+        # fork vs sequential 1 - cos = 6.1e-3, batched vs single-branch fork 4.2e-3; identical shapes are
+        # bit-exact. Require the fork to stay within a few times the model's own batch-shape noise.
+        assert 1 - cos <= 3 * noise + 1e-4, (1 - cos, noise)
+    elif dtype == torch.float32:
         assert diff < TOL
     else:  # bf16/fp16: kernels pick different chunkings for different shapes, so compare direction only.
         # bf16 keeps 3 fewer mantissa bits than fp16. On an L4: bf16 fork vs bf16 sequential 0.999887, while

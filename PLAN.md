@@ -176,6 +176,7 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 | Expanded caches blow memory at K=200 with long states | **Confirmed** (2k × 50 OOMs on 11 GB). `expand` doesn't help, because the cache update concatenates and materialises the KV. **Mitigated** by `chunk_size`, which keeps memory flat in K. A two-level fork would also cut per-row cost. |
 | fla runs fp32 as TF32 on Ampere+ (Triton default plus a hard-coded `solve_tril` precision) | **Confirmed** on L4 (2e-2 drift). `system_one.kernels.disable_fla_tf32()` for fp32 runs and tests |
 | fla version drift: 0.5.2 won't import on Triton 3.9, and transformers then silently uses torch kernels | Check that `import fla` succeeds before trusting GPU numbers. Pin fla and Triton together |
+| FP8 / MoE reads depend on batch shape (A3B fork vs sequential 1 − cos 6e-3; batch shape alone 4e-3) | **Confirmed**, not a fork bug. MoE real-weight test compares against the measured batch-shape noise. For batch-invariant answers, use bf16 dense or a deterministic serving mode |
 | fla's DeltaNet kernel is slow on pre-Ampere GPUs | Measured on Turing: 64% of GPU time, and slower than the torch path for short branches. Choose the kernel per phase, and benchmark on Ampere+ before optimising. |
 | fla installed but running on CPU | transformers binds fla at import time for any device, and Triton then fails. Hide fla on CPU (`tests/conftest.py`, `Backbone.from_pretrained`). |
 | 0.8B too weak for hard knowledge tasks (MMLU/GPQA) | Expected. Judge it on calibration (confidence drops when out of depth), not raw accuracy. The same code scales to Qwen3.5-2B/4B/9B. |
@@ -197,6 +198,7 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 ## Immediate next steps (updated 2026-11-13)
 1. ~~Recover the dev box GPU~~ Superseded: GPU work now runs on an L4 (24 GB, sm89) dev pod.
 2. ~~n = 500 zero-shot run on 6 datasets~~ Done, with Gemini Decision 1 (Google's hosted Decisions API, same question schema) as a reference. Letter-logit is the best local scorer everywhere except SST-5, and Gemini leads by 0.15–0.36 acc with ECE ≤ 0.04 on 4 of 6.
+2a. ~~Larger backbones~~ Done: 9B (bf16) and 35B-A3B (FP8 on an L40S) through `system_one.models`, plus vLLM 0.32 `/v1/systemone` as a second reference. 9B letter is within 0.01–0.06 of Gemini; A3B FP8 isn't better than 9B zero-shot and is 2–3× slower. FP8 (and MoE routing) make reads batch-shape dependent (README).
 2b. Use Gemini Decision 1 as a teacher: its probability distributions are candidate soft labels for the RLCD v2 stage (§4), when training resumes.
 3. M3 on the zero-shot scorers: fit temperature per (type, K-bucket), plus reliability plots and the stress suite (permutation, K scaling, fan-out, empty state).
 4. Kernel choice per phase on Ampere+: profile fla vs. torch for short branches on the L4 (bf16), and debug fla 0.6 `fused_recurrent` + `initial_state` (it returned NaN) before considering it for branches.
