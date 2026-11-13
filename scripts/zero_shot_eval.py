@@ -3,6 +3,7 @@
     python scripts/zero_shot_eval.py --limit 200                  # CUDA if available
     python scripts/zero_shot_eval.py --limit 20 --device cpu      # quick CPU check
     GEMINI_API_KEY=... python scripts/zero_shot_eval.py --scorers gemini   # Google Decisions API reference
+    python scripts/zero_shot_eval.py --scorers vllm --model 9b            # vLLM /v1/systemone serving the same model
 
 Each example becomes one single-question request (context in the state), so the numbers measure the
 scorers, not batching. Prints a markdown table per dataset and scorer.
@@ -18,13 +19,15 @@ import numpy as np
 import torch
 from datasets import load_dataset
 
-from system_one.gemini import GeminiDecisions
+from system_one.remote import GeminiDecisions, VllmSystemOne
 from system_one.metrics import binary_metrics, categorical_metrics, ordinal_metrics
 from system_one.predict import predict
 from system_one.schema import Request
+from system_one.models import resolve
 from system_one.scorers import Backbone, LetterScorer, LikelihoodScorer
 from system_one.templates import option_keys
 
+REMOTE = {"gemini", "vllm"}  # scorers served over HTTP; no local model needed
 SST5_LEVELS = ["Very negative", "Negative", "Neutral", "Positive", "Very positive"]
 
 
@@ -118,17 +121,19 @@ def main():
     parser.add_argument("--json", help="also write results here")
     parser.add_argument("--device-map", help='e.g. "auto" to shard a model across GPUs')
     parser.add_argument("--quantization", default="default", choices=["default", "fp8", "none"], help="default: fp8 for 35b-a3b")
-    parser.add_argument("--gemini-workers", type=int, default=8, help="concurrent Decisions API requests")
+    parser.add_argument("--remote-workers", type=int, default=8, help="concurrent requests for gemini / vllm")
+    parser.add_argument("--vllm-url", default=None, help="vLLM server for --scorers vllm (default $VLLM_BASE_URL or localhost:8000)")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
-    local = [s for s in args.scorers.split(",") if s != "gemini"]
+    local = [s for s in args.scorers.split(",") if s not in REMOTE]
     backbone = Backbone.from_pretrained(
         args.model, dtype=getattr(torch, args.dtype) if args.dtype else None, device=args.device, device_map=args.device_map,
         quantization=args.quantization,
     ) if local else None
     scorers = {
         "gemini": lambda: GeminiDecisions(),  # hosted reference model; needs GEMINI_API_KEY
+        "vllm": lambda: VllmSystemOne(resolve(args.model), args.vllm_url),  # vLLM /v1/systemone serving --model
         "letter": lambda: LetterScorer(backbone),
         "sum": lambda: LikelihoodScorer(backbone, "sum"),
         "mean": lambda: LikelihoodScorer(backbone, "mean"),
@@ -145,7 +150,7 @@ def main():
         examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
         for scorer_name in args.scorers.split(","):
             start = time.perf_counter()
-            workers = args.gemini_workers if scorer_name == "gemini" else 1
+            workers = args.remote_workers if scorer_name in REMOTE else 1
             m = evaluate(examples, scorers[scorer_name](), workers)
             m["sec_per_example"] = (time.perf_counter() - start) / len(examples)
             results.append({"dataset": name, "scorer": scorer_name, **m})

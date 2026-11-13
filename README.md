@@ -114,7 +114,7 @@ Unlike Turing, bf16 here is 2–3× faster than fp32 for 50+ branches. With 1 br
 | `system_one/metrics.py` | Accuracy, NLL, Brier, ECE-15, and MAE for Score |
 | `tests/test_predict.py` | Schema validation, rendering independent of option order, answer well-formedness, **question/option-order invariance and fan-out = single-question answers for every scorer** (< 1e-5), fork likelihood = unforked likelihood, PMI arithmetic, `<|read|>` fits in the embedding |
 | `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge/Easy, CommonsenseQA, AG News (choice), BoolQ (noul), SST-5 (score). `--scorers gemini` adds Google's hosted Decisions API as a reference |
-| `system_one/gemini.py` | `GeminiDecisions`: client for the Gemini Decisions API (`gemini-decision-1`). Same request shape as §5.2; returns this repo's typed answers. Needs `GEMINI_API_KEY` |
+| `system_one/remote.py` | `GeminiDecisions` (Google Decisions API, `gemini-decision-1`, needs `GEMINI_API_KEY`) and `VllmSystemOne` (vLLM `/v1/systemone`). Same request shape as §5.2; both return this repo's typed answers |
 
 ### M1 results: zero-shot baselines
 `scripts/zero_shot_eval.py --limit 500` (2026-11-13): Qwen3.5-0.8B-Base, fp32 (IEEE) on an L4, plus `--scorers gemini`. n = 500 random examples per dataset (seed 0), the same examples for every scorer. The 95% CI on accuracy is about ±0.04. Bold = best local scorer per column. Gemini Decision 1 is a hosted model of unknown size, included as a ceiling reference, not a like-for-like baseline. Its yes/no outputs are clamped to [0.01, 0.99].
