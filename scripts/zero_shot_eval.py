@@ -121,6 +121,11 @@ def go_emotions(split="test"):
 
 
 MULTI_QUESTION = {"race", "go_emotions"}
+# Held-out split per dataset for fitting calibration (never the split the test numbers come from).
+CALIBRATION_SPLITS = {
+    "arc_challenge": "validation", "arc_easy": "validation", "commonsense_qa": "train", "ag_news": "train",
+    "boolq": "train", "sst5": "validation", "race": "validation", "go_emotions": "validation",
+}  # fmt: skip
 DATASETS = {
     "arc_challenge": arc,
     "arc_easy": arc_easy,
@@ -165,7 +170,13 @@ def evaluate(examples, scorer, workers=1, batch_requests=1):
             gold.append(label)
     if len(kinds) != 1:
         raise ValueError(f"mixed question types in one dataset: {kinds}")
-    return {"noul": binary_metrics, "choice": categorical_metrics, "score": ordinal_metrics}[kind](probs, gold)
+    metrics = {"noul": binary_metrics, "choice": categorical_metrics, "score": ordinal_metrics}[kind](probs, gold)
+    # Per-question predictions for post-hoc calibration (noul as [P(no), P(yes)]).
+    metrics["_preds"] = [
+        {"type": kind, "k": 2 if kind == "noul" else len(p), "probs": [1 - p, p] if kind == "noul" else [float(x) for x in p], "gold": int(g)}
+        for p, g in zip(probs, gold)
+    ]
+    return metrics
 
 
 def main():
@@ -182,6 +193,8 @@ def main():
     parser.add_argument("--quantization", default="default", choices=["default", "fp8", "none"], help="default: fp8 for 35b-a3b")
     parser.add_argument("--remote-workers", type=int, default=8, help="concurrent requests for gemini / vllm / chat:*")
     parser.add_argument("--reasoning-effort", default=None, help="chat:* scorers: OpenAI-style reasoning_effort (default: model default)")
+    parser.add_argument("--split", default="test", choices=["test", "calibration"], help="calibration: held-out split per dataset (CALIBRATION_SPLITS)")
+    parser.add_argument("--dump-preds", help="write per-question probabilities and gold labels here (for scripts/calibrate_eval.py)")
     parser.add_argument("--batch-requests", type=int, default=1, help="local scorers: requests prefilled and branched together")
     parser.add_argument("--chunk-size", type=int, default=None, help="local scorers: max branch rows per forward (default 32)")
     parser.add_argument("--gpu-usd-per-hour", type=float, default=None, help="local / vllm: GPU price, for $ per 1M requests (L4 g6.2xlarge on-demand: 0.9776)")
@@ -205,13 +218,13 @@ def main():
         "sum-pmi": lambda: LikelihoodScorer(backbone, "sum", pmi=True),
         "mean-pmi": lambda: LikelihoodScorer(backbone, "mean", pmi=True),
     }
-    results = []
+    results, dumps = [], {}
     dtype = backbone.text_model.dtype if backbone else "-"
     print(f"\n{args.model} on {args.device}, {dtype}, {args.limit} examples per dataset (seed {args.seed})\n")
     print("| dataset | scorer | requests | questions | acc | NLL | Brier | ECE-15 | MAE / F1 | s/request | ms/question | $ per 1M requests |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for name in args.datasets.split(","):
-        examples = list(DATASETS[name]())
+        examples = list(DATASETS[name](CALIBRATION_SPLITS[name]) if args.split == "calibration" else DATASETS[name]())
         examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
         for scorer_name in args.scorers.split(","):
             start = time.perf_counter()
@@ -221,6 +234,11 @@ def main():
             else:
                 scorer = scorers[scorer_name]()
             m = evaluate(examples, scorer, workers, args.batch_requests)
+            preds = m.pop("_preds")
+            if args.dump_preds:
+                dumps.setdefault(name, {})[scorer_name] = preds
+                with open(args.dump_preds, "w") as f:
+                    json.dump(dumps, f)
             usage = getattr(scorer, "usage", None)
             if usage:  # chat scorer: billed tokens, hard-answer share, cost per call
                 m.update({k: int(v) for k, v in usage.items()})
