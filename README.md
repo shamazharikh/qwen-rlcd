@@ -206,6 +206,31 @@ Cost per call: self-hosted = on-demand price ÷ 3600 × wall-clock seconds per c
 - Real Decision 1 billing is about 2× a token estimate made with the Qwen tokenizer: 125–220 billed tokens per call vs ~70 counted.
 - One SST-5 review per chat model was safety-blocked (`finish_reason` not `stop`) and is scored wrong.
 
+### Multi-question requests (2026-11-14)
+Two datasets put several questions on one state (`zero_shot_eval.py --datasets race,go_emotions --limit 200`): **RACE** (an exam passage of ~400 tokens with 3–6 multiple-choice questions, 702 questions over 200 passages) and **GoEmotions** (a short Reddit comment with 28 yes/no questions, one per emotion, 5,600 questions over 200 comments). This is where the serving designs differ:
+
+- **Our fork:** one state prefill, then every question is a branch in one batch.
+- **Gemini Decision 1:** all questions in one call (up to 1,000).
+- **vLLM `/v1/systemone`:** all questions in one call (up to 64), one read each.
+- **Chat baselines:** one call per question, resending the state every time.
+
+| scorer | RACE acc (ECE) | RACE ms/question | RACE $ per 1M requests | GoEmotions F1 (acc) | GoEmotions ms/question | GoEmotions $ per 1M requests |
+|---|---|---|---|---|---|---|
+| 9B `letter`, our fork (1 at a time, L4) | 0.930 (0.040) | 166 | $158 | 0.121 (0.497) | **19** | $145 |
+| vLLM 9B, 1 at a time (L4) | 0.919 (0.030) | 142 | $135 | 0.139 (0.601) | 23 | $178 |
+| vLLM 9B, 16 concurrent (L4) | 0.919 (0.032) | 130 | $124 | 0.139 (0.600) | 22 | $164 |
+| Gemini Decision 1 (16 concurrent) | 0.942 (0.040) | **11** | **$70** | **0.259** (0.853) | **1.1** | **$129** |
+| Gemini 2.5 Flash-Lite, chat (16 concurrent) | 0.925 (–) | 54 | $153 | 0.218 (0.844) | 53 | $160 |
+| Gemini 3.1 Flash-Lite, chat (16 concurrent) | **0.946** (–) | 50 | $384 | 0.226 (0.833) | 49 | $414 |
+
+ms/question is wall time per request ÷ questions per request. Self-hosted $ = L4 on-demand $0.9776/h × wall time; API $ = billed tokens × list price. GoEmotions is 4.25% positive, so answering "no" everywhere scores 0.958 accuracy with F1 0: **F1 is the metric there** (base-rate guessing gives ≈ 0.04).
+
+- **Asking all questions in one call is what makes Decision 1 cheap.** The chat models resend the RACE passage with every question, so they cost 2.2× (2.5 Flash-Lite) and 5.5× (3.1 Flash-Lite) as much as one Decision 1 call. On GoEmotions the comments are short, so resending them is cheap: 2.5 Flash-Lite costs only 1.2× Decision 1, which bills its 28 question texts (~650 tokens per request).
+- **Wide fan-out is where the fork wins locally.** With 28 questions on a short state, the fork's batched branches cost 19 ms per question, 15–20% less than vLLM (22–23 ms), even though vLLM has CUDA graphs and the fork runs one request at a time in eager mode. On RACE (long state, 3.5 questions) vLLM is cheaper (130–142 vs 166 ms per question). There the fork's chunked prefill and eager kernels dominate, while vLLM's prefix cache shares the passage across the request's questions too.
+- **vLLM's concurrency barely helps here** (−5–8%): each request already fans out into 3–28 reads, so 16 sequences saturate the L4. On single-question requests it cut cost 2.5× (previous section).
+- **9B zero-shot has a "yes" bias on GoEmotions** (accuracy 0.50–0.60 means it says yes to 40–50% of emotions; F1 0.12–0.14). Gemini models are far better calibrated to the base rate (F1 0.22–0.26). That bias is what trained `noul` heads and temperature fitting (M2/M3) should fix. On RACE, 9B is within 0.01–0.03 of the APIs.
+- Cost of this benchmark run: $0.26 of API calls plus about 27 L4-minutes ($0.44).
+
 M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
 - `<|read|>` gets id 248077. The tokenizer uses 248,077 ids but the embedding has 248,320 rows, so no resize is needed.
@@ -216,7 +241,9 @@ M1 design notes:
 - [x] GPU zero-shot run at n = 500 on 6 datasets (L4), plus the Gemini Decisions API reference
 - [ ] Large-K choice datasets (Banking77 / DBpedia-14 / CLINC150) for the K-scaling test, local, vLLM and Gemini
 - [x] Qwen3.5-9B and 35B-A3B (FP8) backbones, and vLLM `/v1/systemone` comparison (n = 500)
-- [ ] Many-questions-per-state benchmark: fork vs vLLM `/v1/systemone` vs Gemini, latency vs #questions (README §7.8)
+- [x] Multi-question benchmark (RACE, GoEmotions): fork vs vLLM `/v1/systemone` vs Gemini Decision 1 vs chat baselines
+- [ ] Batch requests in the fork (prefill states together, run all requests' branches in one batch) and use bf16 / CUDA graphs; then latency vs #questions at 512–32k-token states (README §7.8)
+- [ ] Fix the zero-shot `noul` yes-bias (GoEmotions F1 0.12): temperature / threshold fitting per type (M3), then trained heads (M2)
 - [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B
 - [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
 - [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)
