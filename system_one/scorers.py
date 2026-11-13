@@ -11,7 +11,6 @@ choice/score questions, and a scalar logit of P(yes) for noul questions.
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 
 import torch
@@ -19,7 +18,7 @@ from torch import nn
 
 from system_one import templates
 from system_one.fork import forward_branches_all, prefill_state
-from system_one.kernels import disable_fla_tf32
+from system_one.models import load_text_model
 from system_one.schema import Request
 
 
@@ -31,17 +30,11 @@ class Backbone:
     chunk_size: int | None = 32
 
     @classmethod
-    def from_pretrained(cls, repo: str = "Qwen/Qwen3.5-0.8B-Base", dtype=torch.float32, device=None, **kwargs):
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        if str(device) == "cpu" and "transformers.models.qwen3_5.modeling_qwen3_5" not in sys.modules:
-            # transformers binds the DeltaNet kernel at import and picks fla (CUDA-only) whenever installed.
-            sys.modules.setdefault("fla", None)
-        elif dtype == torch.float32:
-            disable_fla_tf32()  # fp32 should mean fp32: TF32 in fla moves reads by ~2e-2 on Ampere+
-        from transformers import AutoModelForImageTextToText, AutoTokenizer
-
-        model = AutoModelForImageTextToText.from_pretrained(repo, dtype=dtype).eval().to(device)
-        return cls(model.model.language_model, model.lm_head, AutoTokenizer.from_pretrained(repo), **kwargs)
+    def from_pretrained(cls, repo: str = "0.8b", dtype=None, device=None, device_map=None, quantization="default", **kwargs):
+        """`repo`: an alias from `system_one.models.MODELS` (`0.8b`, `9b`, `35b-a3b`) or an HF repo id.
+        `dtype=None` picks fp32 for 0.8B and bf16 (fp16 pre-Ampere) for the larger models."""
+        text_model, lm_head, tokenizer = load_text_model(repo, dtype, device, device_map, quantization)
+        return cls(text_model, lm_head, tokenizer, **kwargs)
 
     @property
     def pad_id(self) -> int:

@@ -3,6 +3,7 @@
 Prints a markdown table of median latency and peak memory per (state length, #branches).
 
     python scripts/bench_fork.py                       # Qwen3.5-0.8B-Base, CUDA
+    python scripts/bench_fork.py --model 9b            # Qwen3.5-9B-Base (bf16; fits a 24 GB GPU)
     python scripts/bench_fork.py --tiny --device cpu   # smoke test without downloading weights
 """
 
@@ -27,10 +28,10 @@ def load(args):
             linear_key_head_dim=16, linear_value_head_dim=16,
         )  # fmt: skip
         return Qwen3_5TextModel(config).eval().to(args.device, args.dtype), 512
-    from transformers import AutoModelForImageTextToText
+    from system_one.models import load_text_model
 
-    model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=args.dtype).eval().to(args.device)
-    return model.model.language_model, model.config.text_config.vocab_size
+    text_model, _, _ = load_text_model(args.model, args.dtype, args.device, args.device_map, args.quantization)
+    return text_model, text_model.config.vocab_size
 
 
 def sync(device):
@@ -55,7 +56,9 @@ def measure(fn, device, repeats):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B-Base")
+    parser.add_argument("--model", default="0.8b", help="alias (0.8b, 9b, 35b-a3b) or HF repo id")
+    parser.add_argument("--device-map", help='e.g. "auto" to shard a model across GPUs')
+    parser.add_argument("--quantization", default="default", choices=["default", "fp8", "none"], help="default: fp8 for 35b-a3b")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default=None, choices=["float32", "bfloat16", "float16"], help="default: bf16 on Ampere+")
     parser.add_argument("--tiny", action="store_true")

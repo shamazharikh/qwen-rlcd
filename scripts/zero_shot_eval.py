@@ -108,20 +108,25 @@ def evaluate(examples, scorer, workers=1):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B-Base")
+    parser.add_argument("--model", default="0.8b", help="alias (0.8b, 9b, 35b-a3b) or HF repo id")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"])
+    parser.add_argument("--dtype", default=None, choices=["float32", "bfloat16", "float16"], help="default: fp32 for 0.8B, bf16 for larger")
     parser.add_argument("--datasets", default=",".join(DATASETS))
     parser.add_argument("--scorers", default="letter,sum,mean,sum-pmi,mean-pmi")
     parser.add_argument("--limit", type=int, default=200, help="random examples per dataset")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", help="also write results here")
+    parser.add_argument("--device-map", help='e.g. "auto" to shard a model across GPUs')
+    parser.add_argument("--quantization", default="default", choices=["default", "fp8", "none"], help="default: fp8 for 35b-a3b")
     parser.add_argument("--gemini-workers", type=int, default=8, help="concurrent Decisions API requests")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
     local = [s for s in args.scorers.split(",") if s != "gemini"]
-    backbone = Backbone.from_pretrained(args.model, dtype=getattr(torch, args.dtype), device=args.device) if local else None
+    backbone = Backbone.from_pretrained(
+        args.model, dtype=getattr(torch, args.dtype) if args.dtype else None, device=args.device, device_map=args.device_map,
+        quantization=args.quantization,
+    ) if local else None
     scorers = {
         "gemini": lambda: GeminiDecisions(),  # hosted reference model; needs GEMINI_API_KEY
         "letter": lambda: LetterScorer(backbone),
@@ -131,7 +136,8 @@ def main():
         "mean-pmi": lambda: LikelihoodScorer(backbone, "mean", pmi=True),
     }
     results = []
-    print(f"\n{args.model} on {args.device}, {args.dtype}, {args.limit} examples per dataset (seed {args.seed})\n")
+    dtype = backbone.text_model.dtype if backbone else "-"
+    print(f"\n{args.model} on {args.device}, {dtype}, {args.limit} examples per dataset (seed {args.seed})\n")
     print("| dataset | scorer | n | acc | NLL | Brier | ECE-15 | MAE | s/example |")
     print("|---|---|---|---|---|---|---|---|---|")
     for name in args.datasets.split(","):
