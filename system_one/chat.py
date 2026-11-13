@@ -80,7 +80,7 @@ class ChatCompletionScorer:
             raise RuntimeError("set GEMINI_API_KEY (or OPENAI_API_KEY)")
         self.reasoning_effort, self.logprobs, self.max_tokens = reasoning_effort, logprobs, max_tokens
         self.retries, self.timeout = retries, timeout
-        self.usage = Counter()  # prompt_tokens, completion_tokens, calls, hard_answers, invalid
+        self.usage = Counter()  # prompt_tokens, completion_tokens, calls, hard_answers, invalid, blocked
 
     def predict(self, request: Request | dict) -> dict:
         if isinstance(request, dict):
@@ -109,7 +109,10 @@ class ChatCompletionScorer:
             probs = label_probs(content_lp[0].get("top_logprobs"), labels)
         if probs is None:
             self.usage["hard_answers"] += 1
-            picked = parse(choice["message"].get("content"), labels)
+            # A safety-blocked or empty reply has no message/content: counted as invalid (scored wrong).
+            if choice.get("finish_reason") not in (None, "stop", "length"):
+                self.usage["blocked"] += 1
+            picked = parse((choice.get("message") or {}).get("content"), labels)
             if picked is None:
                 self.usage["invalid"] += 1
                 probs = [1.0 / len(labels)] * len(labels)  # unparseable: uniform (scored as wrong by the eval)

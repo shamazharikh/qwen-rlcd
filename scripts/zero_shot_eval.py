@@ -183,9 +183,9 @@ def main():
                 f"| {name} | {scorer_name} | {m['n']} | {m['acc']:.3f} | {cal} | {mae} | {m['sec_per_example']:.3f} | {cost} |",
                 flush=True,
             )
-    if args.json:
-        with open(args.json, "w") as f:
-            json.dump(results, f, indent=2)
+            if args.json:  # rewrite after every row so a crash keeps finished results
+                with open(args.json, "w") as f:
+                    json.dump(results, f, indent=2)
 
 
 if __name__ == "__main__":

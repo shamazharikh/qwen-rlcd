@@ -184,6 +184,28 @@ Other local scorers that beat `letter`: SST-5 sum-pmi 0.306 (0.8B) / 0.484 (9B),
 
 Changing only the batch shape moves reads as much as the fork does, and identical shapes are bit-exact. The source is FP8: dense models in FP8 already drift 17–18× more than in bf16 (fork vs sequential 1 − cos: 0.8B 2.7e-3, 9B 1.7e-3, vs 1.5e-4 / 1.0e-4 in bf16), because quantizing activations to coarse steps turns rounding-level differences into step-sized jumps. MoE then flips about one of the top-8 experts in a third of the layers. Next-token distributions move by 0.04–0.09 total variation, enough to flip near-tied answers. The real-weight test therefore checks MoE models against their own batch-shape noise (fork within 3× of batched-vs-single-branch fork) instead of a fixed cosine. For batch-invariant FP8/MoE answers, a deterministic serving mode would be needed (vLLM has `VLLM_BATCH_INVARIANT=1`).
 
+### 9B vs Gemini chat-completion baselines, with cost per call (n = 500, 2026-11-14)
+Same examples as above. Gemini 2.5 Flash-Lite and 3.1 Flash-Lite run through Gemini's OpenAI-compatible `/chat/completions` (`--scorers chat:<model>`, `system_one/chat.py`): lettered options, "answer with the letter only", temperature 0, no thinking tokens used. That endpoint rejects `logprobs`, so the chat models return hard labels only, with no probabilities or calibration. API scorers ran with 16 concurrent requests.
+
+| dataset | 9B `letter` (fork) | vLLM 9B (16 concurrent) | Gemini 2.5 Flash-Lite (chat) | Gemini 3.1 Flash-Lite (chat) | Gemini Decision 1 |
+|---|---|---|---|---|---|
+| ARC-Challenge | 0.928 | 0.928 | 0.932 | 0.964 | **0.968** |
+| ARC-Easy | 0.982 | 0.982 | 0.972 | **0.992** | 0.990 |
+| CommonsenseQA | 0.816 | 0.814 | 0.810 | **0.870** | 0.860 |
+| AG News | 0.870 | 0.854 | 0.806 | 0.872 | **0.890** |
+| BoolQ | 0.886 | 0.878 | 0.892 | 0.900 | **0.926** |
+| SST-5 (MAE) | 0.480 (0.57) | 0.490 (0.58) | 0.528 (0.54) | **0.574 (0.46)** | 0.542 (0.50) |
+| probabilities (ECE-15) | yes (0.03–0.15) | yes (0.02–0.09) | no | no | yes (0.02–0.09) |
+| **$ per 1M calls** | 45–52 (1 at a time) | **8–15** (mean 10) | **9–18** | 23–45 | 13–22 |
+
+Cost per call: self-hosted = on-demand price ÷ 3600 × wall-clock seconds per call (L4 g6.2xlarge $0.9776/h). APIs = billed prompt and completion tokens × Google list price (2.5 Flash-Lite $0.10 / $0.40 per M, 3.1 Flash-Lite $0.25 / $1.50, Decision 1 $0.10 input only). Per-dataset spread comes mostly from input length (BoolQ passages are longest).
+
+- **Concurrency matters for self-hosting.** vLLM 9B goes from $24.5 per 1M calls one at a time to $15.8 with 4 concurrent and $10.0 with 16 (0.03–0.06 s per call), with unchanged accuracy (±0.01). That's on par with 2.5 Flash-Lite and below Decision 1, on an on-demand L4 (spot or reserved is 20–37% cheaper). Our fork still serves one request at a time; batching requests is the obvious next step (prefill states together, then run all requests' branches in one batch).
+- **3.1 Flash-Lite is the most accurate chat baseline** (best on SST-5, CommonsenseQA and ARC-Easy) but costs 2–3× more than 2.5 Flash-Lite or Decision 1, and gives no confidence to threshold on.
+- **9B (zero-shot) ≈ 2.5 Flash-Lite on accuracy** (−0.05 to +0.06 per dataset) and adds calibrated probabilities. Gemini Decision 1 stays the best accuracy-per-dollar API with probabilities.
+- Real Decision 1 billing is about 2× a token estimate made with the Qwen tokenizer: 125–220 billed tokens per call vs ~70 counted.
+- One SST-5 review per chat model was safety-blocked (`finish_reason` not `stop`) and is scored wrong.
+
 M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
 - `<|read|>` gets id 248077. The tokenizer uses 248,077 ids but the embedding has 248,320 rows, so no resize is needed.
