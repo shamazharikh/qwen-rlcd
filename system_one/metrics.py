@@ -23,7 +23,8 @@ def ece(confidences, correct, bins: int = 15) -> float:
 def categorical_metrics(probs: list[np.ndarray], gold: list[int]) -> dict[str, float]:
     """Accuracy, NLL, multi-class Brier and ECE-15 (on top-1 probability) for per-example distributions."""
     top = [int(np.argmax(p)) for p in probs]
-    correct = [t == g for t, g in zip(top, gold)]
+    # A tie for the top probability (e.g. a uniform fallback for an unparseable answer) counts as wrong.
+    correct = [t == g and int((p == p[t]).sum()) == 1 for p, t, g in zip(probs, top, gold)]
     nll = [-math.log(max(p[g], 1e-12)) for p, g in zip(probs, gold)]
     brier = [float(((p - np.eye(len(p))[g]) ** 2).sum()) for p, g in zip(probs, gold)]
     return {
