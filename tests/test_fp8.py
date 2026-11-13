@@ -11,6 +11,8 @@ from system_one.models import load_text_model
 
 FP8_OK = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
 pytestmark = pytest.mark.skipif(not FP8_OK, reason="needs a CUDA GPU with FP8 (sm >= 89)")
+if FP8_OK:
+    pytest.importorskip("kernels", reason="install the [fp8] extra for FP8 matmul kernels")
 
 
 @pytest.fixture(scope="module")
