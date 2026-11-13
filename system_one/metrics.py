@@ -37,7 +37,12 @@ def categorical_metrics(probs: list[np.ndarray], gold: list[int]) -> dict[str, f
 
 
 def binary_metrics(p_yes: list[float], gold: list[int]) -> dict[str, float]:
-    return categorical_metrics([np.array([1 - p, p]) for p in p_yes], gold)
+    """Categorical metrics plus F1 of the positive class (decision at P(yes) > 0.5), for imbalanced multi-label sets."""
+    out = categorical_metrics([np.array([1 - p, p]) for p in p_yes], gold)
+    pred, g = np.asarray(p_yes) > 0.5, np.asarray(gold) == 1
+    tp = float((pred & g).sum())
+    out["f1"] = 2 * tp / (pred.sum() + g.sum()) if pred.sum() + g.sum() else float("nan")
+    return out
 
 
 def ordinal_metrics(probs: list[np.ndarray], gold: list[int]) -> dict[str, float]:

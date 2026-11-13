@@ -6,8 +6,17 @@
     python scripts/zero_shot_eval.py --scorers vllm --model 9b            # vLLM /v1/systemone serving the same model
     GEMINI_API_KEY=... python scripts/zero_shot_eval.py --scorers chat:gemini-2.5-flash-lite,chat:gemini-3.1-flash-lite
 
-Each example becomes one single-question request (context in the state), so the numbers measure the
-scorers, not batching. Prints a markdown table per dataset and scorer.
+Single-question datasets turn each example into a one-question request (context in the state). Multi-question
+datasets put several questions on one state, which is where the fork (one prefill, many branches), Gemini
+Decisions (up to 1,000 questions per call), vLLM /v1/systemone (64) and chat baselines (one call per question)
+differ in latency and cost:
+
+- `race`: an exam passage with 3-6 multiple-choice questions (long state, few questions).
+- `go_emotions`: a comment with 28 yes/no emotion questions (short state, wide fan-out; reports binary F1).
+
+    python scripts/zero_shot_eval.py --datasets race,go_emotions --limit 200 --gpu-usd-per-hour 0.9776
+
+Metrics pool every question in a dataset. Prints a markdown table per dataset and scorer.
 """
 
 import argparse
@@ -85,6 +94,33 @@ def sst5(split="test"):
         yield {"state": ex["text"], "questions": {"q": q}}, ex["label"]
 
 
+def race(split="test"):
+    """RACE: questions grouped by passage, one request per passage."""
+    passages = {}
+    for ex in load_dataset("ehovy/race", "all", split=split):
+        passages.setdefault(ex["example_id"], (ex["article"], []))[1].append(ex)
+    for article, rows in passages.values():
+        questions, labels = {}, {}
+        for i, ex in enumerate(rows):
+            qid = f"q{i}"
+            instructions = ex["question"] if "_" not in ex["question"] else f"Which option best completes: {ex['question']}"
+            questions[qid] = {"type": "choice", "instructions": instructions, "criteria": dict(zip("ABCD", ex["options"]))}
+            labels[qid] = ex["answer"]
+        yield {"state": article, "questions": questions}, labels
+
+
+def go_emotions(split="test"):
+    """GoEmotions (simplified): 28 yes/no questions per comment, one per emotion label (multi-label gold)."""
+    ds = load_dataset("google-research-datasets/go_emotions", "simplified", split=split)
+    names = ds.features["labels"].feature.names
+    def text(n):
+        return "The text is emotionally neutral." if n == "neutral" else f"The text expresses {n}."
+    for ex in ds:
+        questions = {n: {"type": "noul", "instructions": text(n)} for n in names}
+        yield {"state": ex["text"], "questions": questions}, {n: int(i in ex["labels"]) for i, n in enumerate(names)}
+
+
+MULTI_QUESTION = {"race", "go_emotions"}
 DATASETS = {
     "arc_challenge": arc,
     "arc_easy": arc_easy,
@@ -92,18 +128,26 @@ DATASETS = {
     "ag_news": ag_news,
     "boolq": boolq,
     "sst5": sst5,
+    "race": race,
+    "go_emotions": go_emotions,
 }
 
 
 def evaluate(examples, scorer, workers=1):
-    """`scorer` is a local scorer (run through `predict`) or anything with `.predict(request)`, e.g. GeminiDecisions."""
+    """`scorer` is a local scorer (run through `predict`) or anything with `.predict(request)`, e.g. GeminiDecisions.
+    Labels are a scalar for single-question requests (question id "q") or a {qid: label} dict. Metrics pool all
+    questions; a dataset must use one question type."""
     requests = [Request.from_dict(r) for r, _ in examples]
     run = scorer.predict if hasattr(scorer, "predict") else (lambda r: predict(r, scorer))
     with ThreadPoolExecutor(workers) as pool:
-        answers = list(pool.map(lambda r: run(r)["q"], requests))
-    probs, gold, kind = [], [], None
-    for request, (_, label), answer in zip(requests, examples, answers):
-        q = request.questions["q"]
+        all_answers = list(pool.map(run, requests))
+    probs, gold, kinds = [], [], set()
+    pairs = []
+    for request, (_, labels), answers in zip(requests, examples, all_answers):
+        labels = labels if isinstance(labels, dict) else {"q": labels}
+        pairs += [(request.questions[qid], label, answers[qid]) for qid, label in labels.items()]
+    for q, label, answer in pairs:
+        kinds.add(q.type)
         kind = q.type
         if kind == "noul":
             probs.append(answer.noul)
@@ -114,6 +158,8 @@ def evaluate(examples, scorer, workers=1):
         else:
             probs.append(np.array(answer.probabilities))
             gold.append(label)
+    if len(kinds) != 1:
+        raise ValueError(f"mixed question types in one dataset: {kinds}")
     return {"noul": binary_metrics, "choice": categorical_metrics, "score": ordinal_metrics}[kind](probs, gold)
 
 
@@ -131,6 +177,7 @@ def main():
     parser.add_argument("--quantization", default="default", choices=["default", "fp8", "none"], help="default: fp8 for 35b-a3b")
     parser.add_argument("--remote-workers", type=int, default=8, help="concurrent requests for gemini / vllm / chat:*")
     parser.add_argument("--reasoning-effort", default=None, help="chat:* scorers: OpenAI-style reasoning_effort (default: model default)")
+    parser.add_argument("--gpu-usd-per-hour", type=float, default=None, help="local / vllm: GPU price, for $ per 1M requests (L4 g6.2xlarge on-demand: 0.9776)")
     parser.add_argument("--vllm-url", default=None, help="vLLM server for --scorers vllm (default $VLLM_BASE_URL or localhost:8000)")
     args = parser.parse_args()
 
@@ -152,8 +199,8 @@ def main():
     results = []
     dtype = backbone.text_model.dtype if backbone else "-"
     print(f"\n{args.model} on {args.device}, {dtype}, {args.limit} examples per dataset (seed {args.seed})\n")
-    print("| dataset | scorer | n | acc | NLL | Brier | ECE-15 | MAE | s/example | $ per 1M calls |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("| dataset | scorer | requests | questions | acc | NLL | Brier | ECE-15 | MAE / F1 | s/request | ms/question | $ per 1M requests |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for name in args.datasets.split(","):
         examples = list(DATASETS[name]())
         examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
@@ -170,17 +217,22 @@ def main():
                 m.update({k: int(v) for k, v in usage.items()})
                 m["hard"] = usage["hard_answers"] > usage["calls"] / 2
                 p_in, p_out = PRICES.get(scorer_name[5:], (float("nan"), float("nan")))
-                m["usd_per_call"] = (usage["prompt_tokens"] * p_in + usage["completion_tokens"] * p_out) / 1e6 / usage["calls"]
+                m["usd_per_request"] = (usage["prompt_tokens"] * p_in + usage["completion_tokens"] * p_out) / 1e6 / len(examples)
             elif scorer_name == "gemini":
-                m["usd_per_call"] = scorer.usage_tokens * PRICES["gemini-decision-1"][0] / 1e6 / len(examples)
-            m["sec_per_example"] = (time.perf_counter() - start) / len(examples)
+                m["usd_per_request"] = scorer.usage_tokens * PRICES["gemini-decision-1"][0] / 1e6 / len(examples)
+            m["requests"] = len(examples)
+            m["sec_per_example"] = (time.perf_counter() - start) / len(examples)  # wall time per request
+            if "usd_per_request" not in m and args.gpu_usd_per_hour:
+                m["usd_per_request"] = args.gpu_usd_per_hour / 3600 * m["sec_per_example"]
             results.append({"dataset": name, "scorer": scorer_name, **m})
-            mae = f"{m['mae']:.3f}" if "mae" in m else "–"
+            mae = f"{m['mae']:.3f}" if "mae" in m else f"F1 {m['f1']:.3f}" if name in MULTI_QUESTION and "f1" in m else "–"
             # Hard (one-hot) answers have no meaningful NLL / Brier / ECE.
             cal = "– | – | –" if m.get("hard") else f"{m['nll']:.3f} | {m['brier']:.3f} | {m['ece15']:.3f}"
-            cost = f"{m['usd_per_call'] * 1e6:.2f}" if "usd_per_call" in m else "–"
+            cost = f"{m['usd_per_request'] * 1e6:.2f}" if "usd_per_request" in m else "–"
+            ms_q = 1000 * m["sec_per_example"] * len(examples) / m["n"]
             print(
-                f"| {name} | {scorer_name} | {m['n']} | {m['acc']:.3f} | {cal} | {mae} | {m['sec_per_example']:.3f} | {cost} |",
+                f"| {name} | {scorer_name} | {len(examples)} | {m['n']} | {m['acc']:.3f} | {cal} | {mae} "
+                f"| {m['sec_per_example']:.3f} | {ms_q:.1f} | {cost} |",
                 flush=True,
             )
             if args.json:  # rewrite after every row so a crash keeps finished results
