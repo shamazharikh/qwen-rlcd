@@ -13,7 +13,7 @@ The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md
 | Milestone | Status |
 |---|---|
 | **M0** backbone spike (prefix fork) | ✅ Done. Fork = full forward on real weights (CPU, CUDA + fla, fp32/fp16); 8–19× faster than one forward per branch; chunked branches bound memory. Gradient-through-cache check deferred until training resumes. |
-| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 3 datasets (CPU, n = 100). Remaining: GPU numbers at larger n, two-level fork. |
+| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 6 datasets (L4, n = 500), with Google's Gemini Decisions API as a hosted reference. Remaining: two-level fork. |
 | **M2** training (LoRA + heads) | ⏸ On hold |
 | **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
 | **M4** serving / **M5** multimodal | Not started |
@@ -113,30 +113,45 @@ Unlike Turing, bf16 here is 2–3× faster than fp32 for 50+ branches. With 1 br
 | `system_one/predict.py` | `predict(request, scorer, temperature=None)` → typed answers: softmax / sigmoid, confidence = 1 − H(p)/log K, score = Σ p_i·i (0-based) |
 | `system_one/metrics.py` | Accuracy, NLL, Brier, ECE-15, and MAE for Score |
 | `tests/test_predict.py` | Schema validation, rendering independent of option order, answer well-formedness, **question/option-order invariance and fan-out = single-question answers for every scorer** (< 1e-5), fork likelihood = unforked likelihood, PMI arithmetic, `<|read|>` fits in the embedding |
-| `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge (choice), BoolQ (noul), SST-5 (score) |
+| `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge/Easy, CommonsenseQA, AG News (choice), BoolQ (noul), SST-5 (score). `--scorers gemini` adds Google's hosted Decisions API as a reference |
+| `system_one/gemini.py` | `GeminiDecisions`: client for the Gemini Decisions API (`gemini-decision-1`). Same request shape as §5.2; returns this repo's typed answers. Needs `GEMINI_API_KEY` |
 
 ### M1 results: zero-shot baselines
-`scripts/zero_shot_eval.py --device cpu --limit 100`: Qwen3.5-0.8B-Base, fp32, seed 0. At n = 100, the 95% CI on accuracy is about ±0.09.
+`scripts/zero_shot_eval.py --limit 500` (2026-11-13): Qwen3.5-0.8B-Base, fp32 (IEEE) on an L4, plus `--scorers gemini`. n = 500 random examples per dataset (seed 0), the same examples for every scorer. The 95% CI on accuracy is about ±0.04. Bold = best local scorer per column. Gemini Decision 1 is a hosted model of unknown size, included as a ceiling reference, not a like-for-like baseline. Its yes/no outputs are clamped to [0.01, 0.99].
 
 | dataset (type, K) | scorer | acc | NLL | Brier | ECE-15 | MAE |
 |---|---|---|---|---|---|---|
-| ARC-Challenge (choice, 4–5) | **letter** | **0.60** | **0.92** | **0.50** | 0.16 | – |
-| | sum | 0.32 | 4.01 | 1.12 | 0.47 | – |
-| | mean | 0.40 | 1.38 | 0.74 | 0.11 | – |
-| | sum-pmi | 0.49 | 2.15 | 0.81 | 0.31 | – |
-| | mean-pmi | 0.49 | 1.30 | 0.71 | 0.16 | – |
-| BoolQ (noul) | letter (yes/no logits) | 0.77 | 0.55 | 0.37 | 0.12 | – |
-| | sum / mean | 0.75 | 0.55 | 0.37 | 0.11 | – |
-| | **sum-pmi / mean-pmi** | **0.79** | **0.54** | **0.36** | 0.13 | – |
-| SST-5 (score, 5) | letter | 0.23 | 2.19 | 1.01 | 0.38 | 1.48 |
-| | **sum** | **0.33** | 1.60 | **0.78** | 0.10 | **1.08** |
-| | mean | 0.25 | 1.63 | 0.81 | 0.09 | 1.17 |
-| | sum-pmi | 0.25 | 1.60 | 0.82 | 0.21 | 1.12 |
-| | mean-pmi | 0.25 | **1.59** | 0.79 | **0.03** | 1.17 |
+| ARC-Challenge (choice, 4–5) | **letter** | **0.612** | **0.949** | **0.504** | **0.053** | – |
+| | sum / mean | 0.328 / 0.362 | 3.839 / 1.384 | 1.062 / 0.747 | 0.454 / 0.076 | – |
+| | sum-pmi / mean-pmi | 0.384 / 0.376 | 2.247 / 1.330 | 0.916 / 0.722 | 0.364 / 0.067 | – |
+| | *Gemini Decision 1* | *0.968* | *0.128* | *0.053* | *0.038* | – |
+| ARC-Easy (choice, 4–5) | **letter** | **0.756** | **0.625** | **0.320** | **0.097** | – |
+| | sum / mean | 0.652 / 0.642 | 1.702 / 1.024 | 0.537 / 0.552 | 0.167 / 0.197 | – |
+| | sum-pmi / mean-pmi | 0.598 / 0.584 | 1.308 / 1.089 | 0.579 / 0.590 | 0.183 / 0.177 | – |
+| | *Gemini Decision 1* | *0.990* | *0.058* | *0.018* | *0.035* | – |
+| CommonsenseQA (choice, 5) | letter | **0.496** | **1.245** | **0.625** | **0.056** | – |
+| | sum / mean | 0.382 / 0.440 | 2.151 / 1.369 | 0.894 / 0.695 | 0.332 / **0.056** | – |
+| | sum-pmi / mean-pmi | 0.484 / **0.496** | 1.539 / 1.326 | 0.712 / 0.675 | 0.203 / 0.127 | – |
+| | *Gemini Decision 1* | *0.860* | *0.387* | *0.195* | *0.093* | – |
+| AG News (choice, 4) | **letter** | **0.654** | **0.859** | **0.466** | 0.136 | – |
+| | sum / mean | 0.562 / 0.376 | 2.157 / 1.282 | 0.661 / 0.695 | 0.226 / 0.161 | – |
+| | sum-pmi / mean-pmi | 0.566 / 0.572 | 1.601 / 1.001 | 0.721 / 0.560 | 0.321 / **0.096** | – |
+| | *Gemini Decision 1* | *0.890* | *0.321* | *0.167* | *0.020* | – |
+| BoolQ (noul) | letter (yes/no logits) | **0.770** | **0.540** | **0.359** | 0.107 | – |
+| | sum = mean | 0.758 | 0.541 | 0.360 | **0.093** | – |
+| | sum-pmi = mean-pmi | 0.760 | 0.546 | 0.365 | 0.099 | – |
+| | *Gemini Decision 1* | *0.926* | *0.220* | *0.125* | *0.021* | – |
+| SST-5 (score, 5) | letter | 0.202 | 2.215 | 1.012 | 0.392 | 1.437 |
+| | sum / mean | 0.272 / 0.186 | 1.640 / 1.655 | 0.797 / 0.819 | **0.066** / 0.089 | **1.084** / 1.121 |
+| | sum-pmi / mean-pmi | **0.306** / 0.304 | **1.568** / 1.585 | 0.791 / **0.790** | 0.138 / 0.082 | 1.102 / 1.122 |
+| | *Gemini Decision 1* | *0.542* | *0.952* | *0.567* | *0.091* | *0.501* |
 
-- No single zero-shot scorer wins: letter-logit is clearly best on knowledge MC (ARC) and worst on ordinal sentiment (SST-5). Summed likelihood shows the expected length and prior bias on ARC (NLL 4.0), and PMI recovers a lot of it.
-- SST-5 is weak for every scorer (≤ 0.33 acc against 0.2 chance). That's the case trained Score heads (M2) need to beat.
-- CPU cost is 1.4–5.5 s per example (PMI runs two forks). Rerun on GPU with n ≥ 500 before drawing finer conclusions.
+- **Letter-logit is the best local scorer on every choice dataset**, and on BoolQ too, now that n = 500 tightens the CI. At n = 100, PMI looked best on BoolQ (0.79), but at n = 500 all scorers are within 0.012 there.
+- **PMI helps only where the answer prior is skewed.** On SST-5 it is the best local scorer (0.31 acc). On ARC it recovers summed likelihood's length bias (NLL 3.84 → 2.25) but still trails letter-logit by 0.23.
+- **The gap to Gemini is large on knowledge tasks** (ARC-Challenge 0.61 vs 0.97) and smaller on BoolQ (0.77 vs 0.93). SST-5 is hard for both (0.31 vs 0.54), so trained Score heads (M2) should be judged against that ceiling, not against 1.0.
+- **Gemini is well calibrated out of the box** (ECE ≤ 0.04 on 4 of 6). The local scorers' ECE ranges from 0.05 to 0.39, which is the case for the M3 temperature fitting.
+- Local cost on the L4 in fp32: 0.09–0.12 s/example (0.20–0.23 s for PMI, which runs two forks). Gemini: 0.09 s/example wall time with 8 concurrent requests.
+- The earlier CPU n = 100 numbers are in git history (`8270d63`).
 
 M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
@@ -145,7 +160,8 @@ M1 design notes:
 - In the ARC and SST-5 converters, the question or review text is the state, so PMI's empty-state baseline is meaningful.
 
 ### Next steps
-- [ ] Recover the GPU (reboot / `nvidia-smi -r`), then on one GPU: finish the fp16 benchmark rows (4096 × 50+) and rerun `zero_shot_eval.py` at n ≥ 500
+- [x] GPU zero-shot run at n = 500 on 6 datasets (L4), plus the Gemini Decisions API reference
+- [ ] Large-K choice datasets (Banking77 / DBpedia-14 / CLINC150) for the K-scaling test, local and Gemini
 - [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
 - [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)
 - [ ] M3: temperature fitting per (type, K-bucket) on the zero-shot scorers, plus the stress suite (permutation, K scaling, fan-out, empty state)

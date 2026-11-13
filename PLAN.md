@@ -2,7 +2,7 @@
 
 Companion to `README.md` (the design brief). This plan turns that brief into a buildable project on **`Qwen/Qwen3.5-0.8B-Base`**, and records where the backbone forces changes to the brief.
 
-> **Status (2026-11-13):** M0 ✅ done (gradient-through-cache deferred with training), and now also verified on an L4 (sm89) once fla's TF32 is turned off for fp32. M1 🟡 inference slice done: typed `predict()`, zero-shot and `<|read|>`-head scorers, invariance tests, zero-shot baselines (GPU run at n = 500 on 6 datasets in progress). M2 ⏸ on hold (inference-only scope). M3 has metrics only. M4 and M5 not started. Details and numbers are in README "Project status"; next steps are at the end of this file.
+> **Status (2026-11-13):** M0 ✅ done (gradient-through-cache deferred with training), and now also verified on an L4 (sm89) once fla's TF32 is turned off for fp32. M1 🟡 inference slice done: typed `predict()`, zero-shot and `<|read|>`-head scorers, invariance tests, zero-shot baselines (GPU run at n = 500 on 6 datasets, plus Gemini Decisions API as a hosted reference). M2 ⏸ on hold (inference-only scope). M3 has metrics only. M4 and M5 not started. Details and numbers are in README "Project status"; next steps are at the end of this file.
 
 ---
 
@@ -196,7 +196,8 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 
 ## Immediate next steps (updated 2026-11-13)
 1. ~~Recover the dev box GPU~~ Superseded: GPU work now runs on an L4 (24 GB, sm89) dev pod.
-2. Finish the n = 500 zero-shot run on 6 datasets (ARC-Challenge/Easy, CommonsenseQA, AG News, BoolQ, SST-5), and replace the CPU n = 100 table in the README.
+2. ~~n = 500 zero-shot run on 6 datasets~~ Done, with Gemini Decision 1 (Google's hosted Decisions API, same question schema) as a reference. Letter-logit is the best local scorer everywhere except SST-5, and Gemini leads by 0.15–0.36 acc with ECE ≤ 0.04 on 4 of 6.
+2b. Use Gemini Decision 1 as a teacher: its probability distributions are candidate soft labels for the RLCD v2 stage (§4), when training resumes.
 3. M3 on the zero-shot scorers: fit temperature per (type, K-bucket), plus reliability plots and the stress suite (permutation, K scaling, fan-out, empty state).
 4. Kernel choice per phase on Ampere+: profile fla vs. torch for short branches on the L4 (bf16), and debug fla 0.6 `fused_recurrent` + `initial_state` (it returned NaN) before considering it for branches.
 5. Two-level fork (state → question cache → answers).

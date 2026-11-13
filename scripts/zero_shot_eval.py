@@ -2,6 +2,7 @@
 
     python scripts/zero_shot_eval.py --limit 200                  # CUDA if available
     python scripts/zero_shot_eval.py --limit 20 --device cpu      # quick CPU check
+    GEMINI_API_KEY=... python scripts/zero_shot_eval.py --scorers gemini   # Google Decisions API reference
 
 Each example becomes one single-question request (context in the state), so the numbers measure the
 scorers, not batching. Prints a markdown table per dataset and scorer.
@@ -11,11 +12,13 @@ import argparse
 import json
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 from datasets import load_dataset
 
+from system_one.gemini import GeminiDecisions
 from system_one.metrics import binary_metrics, categorical_metrics, ordinal_metrics
 from system_one.predict import predict
 from system_one.schema import Request
@@ -81,13 +84,16 @@ DATASETS = {
 }
 
 
-def evaluate(examples, scorer):
+def evaluate(examples, scorer, workers=1):
+    """`scorer` is a local scorer (run through `predict`) or anything with `.predict(request)`, e.g. GeminiDecisions."""
+    requests = [Request.from_dict(r) for r, _ in examples]
+    run = scorer.predict if hasattr(scorer, "predict") else (lambda r: predict(r, scorer))
+    with ThreadPoolExecutor(workers) as pool:
+        answers = list(pool.map(lambda r: run(r)["q"], requests))
     probs, gold, kind = [], [], None
-    for request, label in examples:
-        request = Request.from_dict(request)
+    for request, (_, label), answer in zip(requests, examples, answers):
         q = request.questions["q"]
         kind = q.type
-        answer = predict(request, scorer)["q"]
         if kind == "noul":
             probs.append(answer.noul)
             gold.append(label)
@@ -110,11 +116,14 @@ def main():
     parser.add_argument("--limit", type=int, default=200, help="random examples per dataset")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", help="also write results here")
+    parser.add_argument("--gemini-workers", type=int, default=8, help="concurrent Decisions API requests")
     args = parser.parse_args()
 
     torch.set_grad_enabled(False)
-    backbone = Backbone.from_pretrained(args.model, dtype=getattr(torch, args.dtype), device=args.device)
+    local = [s for s in args.scorers.split(",") if s != "gemini"]
+    backbone = Backbone.from_pretrained(args.model, dtype=getattr(torch, args.dtype), device=args.device) if local else None
     scorers = {
+        "gemini": lambda: GeminiDecisions(),  # hosted reference model; needs GEMINI_API_KEY
         "letter": lambda: LetterScorer(backbone),
         "sum": lambda: LikelihoodScorer(backbone, "sum"),
         "mean": lambda: LikelihoodScorer(backbone, "mean"),
@@ -130,7 +139,8 @@ def main():
         examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
         for scorer_name in args.scorers.split(","):
             start = time.perf_counter()
-            m = evaluate(examples, scorers[scorer_name]())
+            workers = args.gemini_workers if scorer_name == "gemini" else 1
+            m = evaluate(examples, scorers[scorer_name](), workers)
             m["sec_per_example"] = (time.perf_counter() - start) / len(examples)
             results.append({"dataset": name, "scorer": scorer_name, **m})
             mae = f"{m['mae']:.3f}" if "mae" in m else "–"
