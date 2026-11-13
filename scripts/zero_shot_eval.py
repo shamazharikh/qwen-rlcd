@@ -195,6 +195,7 @@ def main():
     parser.add_argument("--reasoning-effort", default=None, help="chat:* scorers: OpenAI-style reasoning_effort (default: model default)")
     parser.add_argument("--split", default="test", choices=["test", "calibration"], help="calibration: held-out split per dataset (CALIBRATION_SPLITS)")
     parser.add_argument("--dump-preds", help="write per-question probabilities and gold labels here (for scripts/calibrate_eval.py)")
+    parser.add_argument("--warmup", type=int, default=0, help="run this many requests untimed first (kernel compile/autotune)")
     parser.add_argument("--batch-requests", type=int, default=1, help="local scorers: requests prefilled and branched together")
     parser.add_argument("--chunk-size", type=int, default=None, help="local scorers: max branch rows per forward (default 32)")
     parser.add_argument("--gpu-usd-per-hour", type=float, default=None, help="local / vllm: GPU price, for $ per 1M requests (L4 g6.2xlarge on-demand: 0.9776)")
@@ -227,6 +228,8 @@ def main():
         examples = list(DATASETS[name](CALIBRATION_SPLITS[name]) if args.split == "calibration" else DATASETS[name]())
         examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
         for scorer_name in args.scorers.split(","):
+            if args.warmup and not is_remote(scorer_name):  # untimed: Triton/fla compile and autotune per new shape
+                evaluate(examples[: args.warmup], scorers[scorer_name](), 1, args.batch_requests)
             start = time.perf_counter()
             workers = args.remote_workers if is_remote(scorer_name) else 1
             if scorer_name.startswith("chat:"):
