@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from system_one import templates
-from system_one.fork import forward_branches_all, prefill_state
+from system_one.fork import forward_branches_all, forward_branches_batched, prefill_state, prefill_states
 from system_one.models import load_text_model
 from system_one.schema import Request
 
@@ -54,6 +54,21 @@ class Backbone:
         cache = prefill_state(self.text_model, state_ids)
         return forward_branches_all(self.text_model, cache, state_ids.shape[1], branches, self.pad_id, self.chunk_size)
 
+    def run_batch(self, state_texts: list[str], branches: list[list[list[int]]]) -> list[list[torch.Tensor]]:
+        """Several requests at once: states prefilled together (left-padded), then every request's branches in
+        shared batches of `chunk_size` rows. Returns per request a list of [len_i, d] branch hidden states."""
+        if len(state_texts) == 1:
+            return [self.run(state_texts[0], branches[0])]
+        cache, mask = prefill_states(self.text_model, [self.encode(t) for t in state_texts], self.pad_id)
+        flat = [b for bs in branches for b in bs]
+        rows = [r for r, bs in enumerate(branches) for _ in bs]
+        hidden = forward_branches_batched(self.text_model, cache, mask, flat, rows, self.pad_id, self.chunk_size)
+        out, i = [], 0
+        for bs in branches:
+            out.append(hidden[i : i + len(bs)])
+            i += len(bs)
+        return out
+
     def token_id(self, text: str) -> int:
         ids = self.encode(text)
         if len(ids) != 1:
@@ -76,11 +91,17 @@ class LetterScorer:
 
     @torch.no_grad()
     def __call__(self, request: Request) -> dict[str, torch.Tensor]:
-        qids = list(request.questions)
-        branches = [self.backbone.encode(templates.letter_prompt(request.questions[q])) for q in qids]
-        hidden = self.backbone.run(templates.render_state(request.state), branches)
+        return self.batch([request])[0]
+
+    @torch.no_grad()
+    def batch(self, requests: list[Request]) -> list[dict[str, torch.Tensor]]:
+        branches = [[self.backbone.encode(templates.letter_prompt(q)) for q in r.questions.values()] for r in requests]
+        hidden = self.backbone.run_batch([templates.render_state(r.state) for r in requests], branches)
+        return [self._logits(r, h) for r, h in zip(requests, hidden)]
+
+    def _logits(self, request: Request, hidden: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         out = {}
-        for qid, h in zip(qids, hidden):
+        for qid, h in zip(request.questions, hidden):
             q, logprobs = request.questions[qid], _last_token_logprobs(self.backbone, h)
             if q.type == "noul":
                 out[qid] = logprobs[self.yes_ids].logsumexp(0) - logprobs[self.no_ids].logsumexp(0)
@@ -107,7 +128,9 @@ class LikelihoodScorer:
         return items
 
     def _answer_scores(self, state: str, items) -> torch.Tensor:
-        hidden = self.backbone.run(templates.render_state(state), [ids for _, _, ids in items])
+        return self._scores(items, self.backbone.run(templates.render_state(state), [ids for _, _, ids in items]))
+
+    def _scores(self, items, hidden) -> torch.Tensor:
         scores = []
         for (_, prefix_len, ids), h in zip(items, hidden):
             # Hidden state at t predicts token t + 1; the answer span is ids[prefix_len:].
@@ -119,11 +142,18 @@ class LikelihoodScorer:
 
     @torch.no_grad()
     def __call__(self, request: Request) -> dict[str, torch.Tensor]:
-        items = self._branches(request)
-        scores = self._answer_scores(request.state, items)
-        if self.pmi:
-            scores = scores - self._answer_scores("", items)
-        return _group(request, [qid for qid, _, _ in items], scores)
+        return self.batch([request])[0]
+
+    @torch.no_grad()
+    def batch(self, requests: list[Request]) -> list[dict[str, torch.Tensor]]:
+        items = [self._branches(r) for r in requests]
+        branches = [[ids for _, _, ids in it] for it in items]
+        hidden = self.backbone.run_batch([templates.render_state(r.state) for r in requests], branches)
+        scores = [self._scores(it, h) for it, h in zip(items, hidden)]
+        if self.pmi:  # same branches under an empty state
+            empty = self.backbone.run_batch([templates.render_state("")] * len(requests), branches)
+            scores = [s - self._scores(it, h) for s, it, h in zip(scores, items, empty)]
+        return [_group(r, [qid for qid, _, _ in it], s) for r, it, s in zip(requests, items, scores)]
 
 
 class DecisionHeads(nn.Module):

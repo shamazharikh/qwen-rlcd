@@ -49,6 +49,78 @@ def expand_cache(cache: DynamicCache, n: int, batch_size: int = 1) -> DynamicCac
     return new
 
 
+def select_cache_rows(cache: DynamicCache, rows: torch.LongTensor, batch_size: int) -> DynamicCache:
+    """New cache whose row i is source row `rows[i]` (every batched tensor state is gathered along dim 0)."""
+
+    def take(value):
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+            return value.index_select(0, rows.to(value.device))
+        if isinstance(value, dict):
+            return {k: take(v) for k, v in value.items()}
+        return value
+
+    new = copy.copy(cache)
+    new.layers = []
+    for layer in cache.layers:
+        clone = copy.copy(layer)
+        for name, value in vars(layer).items():
+            setattr(clone, name, take(value) if isinstance(value, (torch.Tensor, dict)) else value)
+        new.layers.append(clone)
+    return new
+
+
+def prefill_states(text_model, states: list[list[int]], pad_id: int) -> tuple[DynamicCache, torch.Tensor]:
+    """Prefill several states in one batch, left-padded to the longest. Returns the cache and the [B, S_max]
+    padding mask (1 = real token). Real tokens get positions 0..len-1, as in an unpadded prefill; DeltaNet
+    layers zero the padded positions, so their recurrent and conv states start exactly as for an unpadded row."""
+    if any(len(s) == 0 for s in states):
+        raise ValueError("states must be non-empty")
+    device = text_model.embed_tokens.weight.device
+    b, s_max = len(states), max(len(s) for s in states)
+    input_ids = torch.full((b, s_max), pad_id, dtype=torch.long, device=device)
+    mask = torch.zeros((b, s_max), dtype=torch.long, device=device)
+    for i, s in enumerate(states):
+        input_ids[i, s_max - len(s) :] = torch.tensor(s, dtype=torch.long, device=device)
+        mask[i, s_max - len(s) :] = 1
+    position_ids = (mask.cumsum(-1) - 1).clamp_min(0)
+    cache = DynamicCache(config=text_model.config)
+    text_model(input_ids=input_ids, attention_mask=mask, position_ids=position_ids, past_key_values=cache, use_cache=True)
+    return cache, mask
+
+
+def forward_branches_batched(
+    text_model,
+    state_cache: DynamicCache,
+    state_mask: torch.Tensor,
+    branches: list[list[int]],
+    rows: list[int],
+    pad_id: int,
+    chunk_size: int | None = None,
+) -> list[torch.Tensor]:
+    """Run `branches` (branch i continues state row `rows[i]` of a `prefill_states` cache) as right-padded
+    batches. Returns each branch's final-norm hidden states over its real tokens, a list of [len_i, d]."""
+    if len(rows) != len(branches) or any(len(b) == 0 for b in branches):
+        raise ValueError("need one state row per branch, and non-empty branches")
+    step = chunk_size or len(branches)
+    device, batch_size = text_model.embed_tokens.weight.device, state_mask.shape[0]
+    out_all = []
+    for start in range(0, len(branches), step):
+        chunk, idx = branches[start : start + step], torch.tensor(rows[start : start + step], device=device)
+        n, max_len = len(chunk), max(len(b) for b in chunk)
+        input_ids = torch.full((n, max_len), pad_id, dtype=torch.long, device=device)
+        for i, b in enumerate(chunk):
+            input_ids[i, : len(b)] = torch.tensor(b, dtype=torch.long, device=device)
+        smask = state_mask.index_select(0, idx)
+        position_ids = smask.sum(-1, keepdim=True) + torch.arange(max_len, device=device)  # continue at each row's own length
+        attention_mask = torch.cat([smask, torch.ones((n, max_len), dtype=smask.dtype, device=device)], dim=1)
+        cache = select_cache_rows(state_cache, idx, batch_size)
+        out = text_model(
+            input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, past_key_values=cache, use_cache=True
+        )
+        out_all += [out.last_hidden_state[i, : len(b)] for i, b in enumerate(chunk)]
+    return out_all
+
+
 def forward_branches_all(
     text_model,
     state_cache: DynamicCache,

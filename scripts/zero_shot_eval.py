@@ -32,7 +32,7 @@ from datasets import load_dataset
 from system_one.chat import ChatCompletionScorer
 from system_one.remote import GeminiDecisions, VllmSystemOne
 from system_one.metrics import binary_metrics, categorical_metrics, ordinal_metrics
-from system_one.predict import predict
+from system_one.predict import predict, predict_batch
 from system_one.schema import Request
 from system_one.models import resolve
 from system_one.scorers import Backbone, LetterScorer, LikelihoodScorer
@@ -133,14 +133,19 @@ DATASETS = {
 }
 
 
-def evaluate(examples, scorer, workers=1):
+def evaluate(examples, scorer, workers=1, batch_requests=1):
     """`scorer` is a local scorer (run through `predict`) or anything with `.predict(request)`, e.g. GeminiDecisions.
     Labels are a scalar for single-question requests (question id "q") or a {qid: label} dict. Metrics pool all
     questions; a dataset must use one question type."""
     requests = [Request.from_dict(r) for r, _ in examples]
-    run = scorer.predict if hasattr(scorer, "predict") else (lambda r: predict(r, scorer))
-    with ThreadPoolExecutor(workers) as pool:
-        all_answers = list(pool.map(run, requests))
+    if not hasattr(scorer, "predict") and batch_requests > 1:  # local fork scorer: several requests per forward
+        all_answers = []
+        for i in range(0, len(requests), batch_requests):
+            all_answers += predict_batch(requests[i : i + batch_requests], scorer)
+    else:
+        run = scorer.predict if hasattr(scorer, "predict") else (lambda r: predict(r, scorer))
+        with ThreadPoolExecutor(workers) as pool:
+            all_answers = list(pool.map(run, requests))
     probs, gold, kinds = [], [], set()
     pairs = []
     for request, (_, labels), answers in zip(requests, examples, all_answers):
@@ -177,6 +182,8 @@ def main():
     parser.add_argument("--quantization", default="default", choices=["default", "fp8", "none"], help="default: fp8 for 35b-a3b")
     parser.add_argument("--remote-workers", type=int, default=8, help="concurrent requests for gemini / vllm / chat:*")
     parser.add_argument("--reasoning-effort", default=None, help="chat:* scorers: OpenAI-style reasoning_effort (default: model default)")
+    parser.add_argument("--batch-requests", type=int, default=1, help="local scorers: requests prefilled and branched together")
+    parser.add_argument("--chunk-size", type=int, default=None, help="local scorers: max branch rows per forward (default 32)")
     parser.add_argument("--gpu-usd-per-hour", type=float, default=None, help="local / vllm: GPU price, for $ per 1M requests (L4 g6.2xlarge on-demand: 0.9776)")
     parser.add_argument("--vllm-url", default=None, help="vLLM server for --scorers vllm (default $VLLM_BASE_URL or localhost:8000)")
     args = parser.parse_args()
@@ -187,6 +194,8 @@ def main():
         args.model, dtype=getattr(torch, args.dtype) if args.dtype else None, device=args.device, device_map=args.device_map,
         quantization=args.quantization,
     ) if local else None
+    if backbone and args.chunk_size:
+        backbone.chunk_size = args.chunk_size
     scorers = {
         "gemini": lambda: GeminiDecisions(),  # hosted reference model; needs GEMINI_API_KEY
         "vllm": lambda: VllmSystemOne(resolve(args.model), args.vllm_url),  # vLLM /v1/systemone serving --model
@@ -211,7 +220,7 @@ def main():
                 scorer = ChatCompletionScorer(scorer_name[5:], reasoning_effort=args.reasoning_effort)
             else:
                 scorer = scorers[scorer_name]()
-            m = evaluate(examples, scorer, workers)
+            m = evaluate(examples, scorer, workers, args.batch_requests)
             usage = getattr(scorer, "usage", None)
             if usage:  # chat scorer: billed tokens, hard-answer share, cost per call
                 m.update({k: int(v) for k, v in usage.items()})

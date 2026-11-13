@@ -35,6 +35,25 @@ def to_answer(request: Request, qid: str, logits: torch.Tensor, temperature: flo
     return ScoreAnswer(score=(p * levels).sum().item(), probabilities=p.tolist(), confidence=confidence(p))
 
 
+def predict_batch(
+    requests: list[Request | dict],
+    scorer: Scorer,
+    temperature: Callable[[str, int], float] | None = None,
+) -> list[dict[str, Answer]]:
+    """`predict` for several requests. Scorers with a `batch` method (the fork scorers) prefill all states
+    together and share branch batches across requests; others are called one request at a time."""
+    requests = [Request.from_dict(r) if isinstance(r, dict) else r for r in requests]
+    all_logits = scorer.batch(requests) if hasattr(scorer, "batch") else [scorer(r) for r in requests]
+    out = []
+    for request, logits in zip(requests, all_logits):
+        answers = {}
+        for qid, q in request.questions.items():
+            t = temperature(q.type, q.num_options) if temperature else 1.0
+            answers[qid] = to_answer(request, qid, logits[qid], t)
+        out.append(answers)
+    return out
+
+
 def predict(
     request: Request | dict,
     scorer: Scorer,
