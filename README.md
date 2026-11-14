@@ -231,6 +231,40 @@ ms/question is wall time per request ÷ questions per request. Self-hosted $ = L
 - **9B zero-shot has a "yes" bias on GoEmotions** (accuracy 0.50–0.60 means it says yes to 40–50% of emotions; F1 0.12–0.14). Gemini models are far better calibrated to the base rate (F1 0.22–0.26). That bias is what trained `noul` heads and temperature fitting (M2/M3) should fix. On RACE, 9B is within 0.01–0.03 of the APIs.
 - Cost of this benchmark run: $0.26 of API calls plus about 27 L4-minutes ($0.44).
 
+### Batched requests in the fork (2026-11-14)
+`Backbone.run_batch` / `predict_batch` prefill several requests' states together (left-padded; DeltaNet layers zero the pad positions, so they never reach the recurrent state), then run all requests' branches in shared batches, each continuing its own cache row with its own padding mask and positions. Batched reads match per-request forks to < 1e-5 (tiny dense and MoE models). A leaky variant without the padding mask diverges by 1.56, so the test is sensitive. `zero_shot_eval.py --batch-requests N --chunk-size C --warmup 32`.
+
+9B `letter` on an L4, 200 requests per dataset, seconds per request ($ per 1M requests at $0.9776/h). Accuracy is identical across settings (±0.01):
+
+| batch × chunk | ARC-Challenge | BoolQ | RACE (3.5 Q) | GoEmotions (28 Q) |
+|---|---|---|---|---|
+| 1 × 32 | 0.163 ($44) | 0.174 ($47) | 0.338 ($92) | 0.539 ($146) |
+| 4 × 16 | 0.073 ($20) | **0.102 ($28)** | **0.332 ($90)** | 0.497 ($135) |
+| 8 × 16 | 0.068 ($19) | 0.102 ($28) | 0.357 ($97) | 0.490 ($133) |
+| 8 × 32 | 0.068 ($18) | 0.103 ($28) | 0.361 ($98) | **0.473 ($128)** |
+| 16 × 16 | **0.066 ($18)** | 0.117 ($32) | 0.418 ($114) | 0.492 ($134) |
+
+- **Single-question requests get 1.7–2.5× cheaper**: 9B on the fork is now $18–28 per 1M requests, level with Gemini Decision 1 ($13–22) and 2.5 Flash-Lite chat ($9–18), and it returns probabilities.
+- **Multi-question requests barely change** (−2% to −12%): one RACE or GoEmotions request already fills the GPU with branches. Batch 4–8 is the sweet spot; 16 slows long states down.
+- **Chunks must stay at 16–32 rows for 9B on 24 GB.** Each branch row holds its own copy of the DeltaNet recurrent state (tens of MB at 9B), so 64-row chunks ran out of memory next to 18 GB of weights.
+- **Time with a warmup.** Batching creates many new shapes, and the first run of each pays Triton/fla compile and autotune. Without `--warmup`, the first configuration measured looked slower than batch 1.
+
+### Calibration and the zero-shot yes-bias (M3, 2026-11-14)
+`--split calibration` runs each dataset on a held-out split (train or validation), and `--dump-preds` saves per-question probabilities. `scripts/calibrate_eval.py` fits `system_one/calibrate.py` and reports test metrics before and after: a temperature per (type, K-bucket) for choice/score, Platt scaling (scale + bias on the logit) for yes/no, and for yes/no datasets also F1 at the threshold that maximises F1 on the calibration split. 9B, 200 calibration and 500 test requests per dataset:
+
+| 9B | raw | calibration pooled over datasets (equal weight) | per-dataset calibration | F1 at threshold tuned on calibration split |
+|---|---|---|---|---|
+| choice, `letter` (ARC, CSQA, AG News, RACE) | ECE 0.02–0.06 | T = 1.04: no change | small gains (ARC-Easy ECE 0.043 → 0.017) | – |
+| SST-5 `letter` (score) | ECE 0.143 | T = 1.28: ECE 0.079, NLL 1.190 → 1.155 | same | – |
+| GoEmotions `letter` | F1 0.117, ECE 0.221 | **F1 0.257**, ECE 0.080 | F1 0.003 (ECE 0.005, NLL 0.153) | 0.221 |
+| GoEmotions `sum-pmi` | F1 0.185, ECE 0.035 | F1 0.261 | F1 0.023 | **0.264** |
+| BoolQ `letter` | acc 0.892, F1 0.915 | acc 0.848, F1 0.864 (worse) | 0.892 / 0.912 | 0.912 |
+
+- **9B's multiple-choice reads are already calibrated** (fitted T ≈ 1.04). The miscalibration is in yes/no questions and in SST-5's ordinal levels (T = 1.28).
+- **The yes-bias depends on the task.** One yes/no correction shared by all datasets must trade GoEmotions (needs a −2 to −3.6 logit shift) against BoolQ (needs none). Fit per question count it is dominated by GoEmotions' 5,600 questions and drops BoolQ accuracy to 0.71; with datasets weighted equally the shift is −2.1, fixing GoEmotions but costing BoolQ 0.04.
+- **Calibrated probabilities aren't good decisions for rare labels.** Per-dataset Platt makes GoEmotions probabilities nearly perfect (ECE 0.005), but with a 4% base rate almost nothing then crosses 0.5, so F1 drops to 0.003. A decision threshold tuned for F1 on held-out data gives **F1 0.264 (`sum-pmi`), level with Gemini Decision 1 (0.259) and above 2.5 / 3.1 Flash-Lite chat (0.218 / 0.226)**.
+- Practical recipe: report calibrated probabilities (per type, or per task when a few hundred labels exist), and pick decision thresholds per task on held-out data. The deployable defaults are T = 1.04 (choice) and T = 1.28 (score); yes/no needs per-task calibration.
+
 M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
 - `<|read|>` gets id 248077. The tokenizer uses 248,077 ids but the embedding has 248,320 rows, so no resize is needed.
@@ -242,8 +276,10 @@ M1 design notes:
 - [ ] Large-K choice datasets (Banking77 / DBpedia-14 / CLINC150) for the K-scaling test, local, vLLM and Gemini
 - [x] Qwen3.5-9B and 35B-A3B (FP8) backbones, and vLLM `/v1/systemone` comparison (n = 500)
 - [x] Multi-question benchmark (RACE, GoEmotions): fork vs vLLM `/v1/systemone` vs Gemini Decision 1 vs chat baselines
-- [ ] Batch requests in the fork (prefill states together, run all requests' branches in one batch) and use bf16 / CUDA graphs; then latency vs #questions at 512–32k-token states (README §7.8)
-- [ ] Fix the zero-shot `noul` yes-bias (GoEmotions F1 0.12): temperature / threshold fitting per type (M3), then trained heads (M2)
+- [x] Batch requests in the fork (1.7–2.5× cheaper single-question requests)
+- [ ] CUDA graphs / fused kernels for the fork; latency vs #questions at 512–32k-token states (README §7.8)
+- [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
+- [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
 - [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B
 - [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
 - [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)

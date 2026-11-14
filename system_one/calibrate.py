@@ -31,15 +31,17 @@ def _logit(p):
     return np.log(p) - np.log1p(-p)
 
 
-def fit_temperature(probs: list[np.ndarray], gold: list[int], steps: int = 300) -> float:
-    """T minimising NLL of softmax(log p / T). Log-probs are logits up to a per-row constant."""
+def fit_temperature(probs: list[np.ndarray], gold: list[int], weights=None, steps: int = 300) -> float:
+    """T minimising (weighted) NLL of softmax(log p / T). Log-probs are logits up to a per-row constant."""
     logp = [torch.tensor(np.log(np.clip(p, 1e-12, 1.0)), dtype=torch.float64) for p in probs]
+    w = torch.tensor(weights if weights is not None else [1.0] * len(gold), dtype=torch.float64)
+    w = w / w.sum()
     log_t = torch.zeros((), dtype=torch.float64, requires_grad=True)
     opt = torch.optim.LBFGS([log_t], lr=0.5, max_iter=steps, line_search_fn="strong_wolfe")
 
     def closure():
         opt.zero_grad()
-        loss = sum(-torch.log_softmax(lp / log_t.exp(), -1)[g] for lp, g in zip(logp, gold)) / len(gold)
+        loss = sum(-wi * torch.log_softmax(lp / log_t.exp(), -1)[g] for lp, g, wi in zip(logp, gold, w))
         loss.backward()
         return loss
 
@@ -47,16 +49,18 @@ def fit_temperature(probs: list[np.ndarray], gold: list[int], steps: int = 300) 
     return float(log_t.detach().exp())
 
 
-def fit_platt(p_yes: list[float], gold: list[int], steps: int = 300) -> tuple[float, float]:
-    """(a, b) minimising NLL of sigmoid(a * logit(p) + b)."""
+def fit_platt(p_yes: list[float], gold: list[int], weights=None, steps: int = 300) -> tuple[float, float]:
+    """(a, b) minimising (weighted) NLL of sigmoid(a * logit(p) + b)."""
     x = torch.tensor(_logit(p_yes), dtype=torch.float64)
     y = torch.tensor(gold, dtype=torch.float64)
+    w = torch.tensor(weights if weights is not None else [1.0] * len(gold), dtype=torch.float64)
+    w = w / w.mean()
     ab = torch.tensor([1.0, 0.0], dtype=torch.float64, requires_grad=True)
     opt = torch.optim.LBFGS([ab], lr=0.5, max_iter=steps, line_search_fn="strong_wolfe")
 
     def closure():
         opt.zero_grad()
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(ab[0] * x + ab[1], y)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(ab[0] * x + ab[1], y, weight=w)
         loss.backward()
         return loss
 
@@ -65,7 +69,8 @@ def fit_platt(p_yes: list[float], gold: list[int], steps: int = 300) -> tuple[fl
 
 
 def fit(preds: list[dict]) -> dict[str, dict]:
-    """`preds`: dicts with type, k, probs (list; noul: [P(no), P(yes)]) and gold (index; noul: 1 = yes).
+    """`preds`: dicts with type, k, probs (list; noul: [P(no), P(yes)]), gold (index; noul: 1 = yes) and an
+    optional `weight` (e.g. 1 / questions in its dataset, so one large dataset can't dominate a pooled fit).
     Returns {bucket: {"temperature": T} | {"a": a, "b": b}, ...} with the sample count per bucket."""
     groups: dict[str, list[dict]] = {}
     for p in preds:
@@ -73,11 +78,25 @@ def fit(preds: list[dict]) -> dict[str, dict]:
     params = {}
     for name, rows in groups.items():
         if name == "noul":
-            a, b = fit_platt([r["probs"][1] for r in rows], [r["gold"] for r in rows])
+            a, b = fit_platt([r["probs"][1] for r in rows], [r["gold"] for r in rows], [r.get("weight", 1.0) for r in rows])
             params[name] = {"a": a, "b": b, "n": len(rows)}
         else:
-            params[name] = {"temperature": fit_temperature([np.asarray(r["probs"]) for r in rows], [r["gold"] for r in rows]), "n": len(rows)}
+            t = fit_temperature([np.asarray(r["probs"]) for r in rows], [r["gold"] for r in rows], [r.get("weight", 1.0) for r in rows])
+            params[name] = {"temperature": t, "n": len(rows)}
     return params
+
+
+def best_f1_threshold(p_yes, gold) -> float:
+    """Decision threshold on P(yes) maximising F1 (for rare positive labels, where 0.5 is the wrong cut)."""
+    p, g = np.asarray(p_yes, float), np.asarray(gold) == 1
+    best, best_t = -1.0, 0.5
+    for t in np.unique(np.concatenate([p, [0.5]])):
+        pred = p >= t
+        denom = pred.sum() + g.sum()
+        f1 = 2 * (pred & g).sum() / denom if denom else 0.0
+        if f1 > best:
+            best, best_t = f1, float(t)
+    return best_t
 
 
 def apply(params: dict[str, dict], qtype: str, probs) -> np.ndarray:
