@@ -197,6 +197,7 @@ def main():
     parser.add_argument("--dump-preds", help="write per-question probabilities and gold labels here (for scripts/calibrate_eval.py)")
     parser.add_argument("--warmup", type=int, default=0, help="run this many requests untimed first (kernel compile/autotune)")
     parser.add_argument("--batch-requests", type=int, default=1, help="local scorers: requests prefilled and branched together")
+    parser.add_argument("--no-single-pass", action="store_true", help="local scorers: fork even for one-question requests")
     parser.add_argument("--cuda-graphs", action="store_true", help="local scorers: replay branch forwards as CUDA graphs")
     parser.add_argument("--chunk-size", type=int, default=None, help="local scorers: max branch rows per forward (default 32)")
     parser.add_argument("--gpu-usd-per-hour", type=float, default=None, help="local / vllm: GPU price, for $ per 1M requests (L4 g6.2xlarge on-demand: 0.9776)")
@@ -213,6 +214,7 @@ def main():
         backbone.chunk_size = args.chunk_size
     if backbone:
         backbone.cuda_graphs = args.cuda_graphs
+        backbone.single_pass = not args.no_single_pass
     scorers = {
         "gemini": lambda: GeminiDecisions(),  # hosted reference model; needs GEMINI_API_KEY
         "vllm": lambda: VllmSystemOne(resolve(args.model), args.vllm_url),  # vLLM /v1/systemone serving --model
