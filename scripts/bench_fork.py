@@ -5,6 +5,7 @@ Prints a markdown table of median latency and peak memory per (state length, #br
     python scripts/bench_fork.py                       # Qwen3.5-0.8B-Base, CUDA
     python scripts/bench_fork.py --model 9b            # Qwen3.5-9B-Base (bf16; fits a 24 GB GPU)
     python scripts/bench_fork.py --tiny --device cpu   # smoke test without downloading weights
+    python scripts/bench_fork.py --model 9b --graphs --chunk-size 32   # add a CUDA-graph fork column
 """
 
 import argparse
@@ -13,7 +14,8 @@ import time
 
 import torch
 
-from system_one.fork import fork_forward, sequential_reads
+from system_one.fork import fork_forward, prefill_state, sequential_reads
+from system_one.graphs import GraphBranchRunner
 
 
 def load(args):
@@ -68,6 +70,7 @@ def main():
     parser.add_argument("--max-sequential", type=int, default=50, help="skip the sequential baseline above this")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--chunk-size", type=int, default=None, help="max branch rows per fork forward")
+    parser.add_argument("--graphs", action="store_true", help="also time the fork with CUDA-graph branch replay")
     args = parser.parse_args()
     if args.dtype is None:
         ampere = args.device == "cuda" and torch.cuda.get_device_capability()[0] >= 8
@@ -78,20 +81,35 @@ def main():
     gen = torch.Generator().manual_seed(0)
     hardware = torch.cuda.get_device_name() if args.device == "cuda" else args.device
     print(f"\n{'tiny' if args.tiny else args.model} on {hardware}, {args.dtype}, branch_len={args.branch_len}, chunk_size={args.chunk_size}\n")
-    print("| state tokens | branches | fork ms | fork peak GiB | sequential ms | sequential peak GiB | speedup |")
-    print("|---|---|---|---|---|---|---|")
+    runner = None
+    if args.graphs:
+        chunk = args.chunk_size or 32
+        buckets = tuple(sorted({b for b in (1, 2, 4, 8, 16, 32, 64, 128) if b < chunk} | {chunk}))
+        runner = GraphBranchRunner(model, 0, row_buckets=buckets)
+
+    def fork_graphs(state, branches):
+        cache = prefill_state(model, state)
+        return runner(cache, torch.ones_like(state), branches, [0] * len(branches))
+
+    graph_cols = " graph fork ms | graph peak GiB | graph speedup |" if runner else ""
+    print(f"| state tokens | branches | fork ms | fork peak GiB |{graph_cols} sequential ms | sequential peak GiB | speedup |")
+    print("|---|---|---|---|" + "---|" * (3 if runner else 0) + "---|---|---|")
     for state_len in map(int, args.state_lens.split(",")):
         state = torch.randint(1, vocab, (1, state_len), generator=gen).to(args.device)
         for n in map(int, args.branch_counts.split(",")):
             branches = torch.randint(1, vocab, (n, args.branch_len), generator=gen).tolist()
             with torch.no_grad():
                 fork_ms, fork_mem = measure(lambda: fork_forward(model, state, branches, 0, args.chunk_size), args.device, args.repeats)
+                graph = ""
+                if runner:
+                    g_ms, g_mem = measure(lambda: fork_graphs(state, branches), args.device, args.repeats)
+                    graph = f" {g_ms:.1f} | {g_mem:.2f} | {fork_ms / g_ms:.2f}x |"
                 if n <= args.max_sequential:
                     seq_ms, seq_mem = measure(lambda: sequential_reads(model, state, branches), args.device, args.repeats)
                     seq = f"{seq_ms:.1f} | {seq_mem:.2f} | {seq_ms / fork_ms:.1f}x"
                 else:
                     seq = "– | – | –"
-            print(f"| {state_len} | {n} | {fork_ms:.1f} | {fork_mem:.2f} | {seq} |", flush=True)
+            print(f"| {state_len} | {n} | {fork_ms:.1f} | {fork_mem:.2f} |{graph} {seq} |", flush=True)
 
 
 if __name__ == "__main__":
