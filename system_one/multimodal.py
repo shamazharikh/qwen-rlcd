@@ -94,18 +94,26 @@ def load_video(src, cfg: MediaConfig) -> tuple[np.ndarray, dict]:
     `src`: a path/URL/data URL, or an already-decoded `(frames, source_fps)` tuple."""
     if isinstance(src, tuple):
         all_frames, src_fps = src
+        to_rgb = np.asarray
     else:
         import av
 
+        # Decode every frame (the count fixes the sampling, and container headers can be wrong) but keep them
+        # in their native format: only the sampled frames are converted to RGB, which is most of the CPU cost.
         with av.open(io.BytesIO(_read_bytes(src))) as container:
             stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
             src_fps = float(stream.average_rate or 24)
-            all_frames = np.stack([f.to_ndarray(format="rgb24") for f in container.decode(stream)])
+            all_frames = list(container.decode(stream))
+
+        def to_rgb(frames):
+            return np.stack([f.to_ndarray(format="rgb24") for f in frames])
+
     total = len(all_frames)
     duration = total / src_fps
     n = min(total, max(cfg.min_frames, min(cfg.max_frames, math.floor(duration * cfg.fps))))
     idx = np.linspace(0, total - 1, n, dtype=int)
-    frames = _resize_frames(np.asarray(all_frames)[idx], cfg.video_max_side)
+    frames = _resize_frames(to_rgb([all_frames[i] for i in idx]), cfg.video_max_side)
     meta = {"fps": src_fps, "total_num_frames": total, "duration": duration, "frames_indices": idx.tolist()}
     return frames, meta
 
