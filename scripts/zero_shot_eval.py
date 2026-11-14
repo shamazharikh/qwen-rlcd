@@ -212,17 +212,30 @@ def pope(split="test"):
         yield {"state": "Look at the image.", "images": [img], "questions": qs}, labels
 
 
+def _mmstar_question(text: str):
+    """(instructions, {letter: option}) from MMStar's two formats: 'Q\nOptions: A: x, B: y' and
+    'Hint: ...\nQuestion: Q\nChoices:\n(A) x\n(B) y' (MathVista-style)."""
+    m = re.search(r"\nChoices:\s*\n(.*)$", text, re.S)
+    if m:
+        opts = dict(re.findall(r"^\(([A-F])\)\s*(.+?)\s*$", m.group(1), re.M))
+        q = re.search(r"Question:\s*(.*)$", text[: m.start()], re.S)
+        return (q.group(1) if q else text[: m.start()]).strip(), opts
+    m = re.search(r"\nOptions:\s*(.*)$", text, re.S)
+    if not m:
+        return text.strip(), {}
+    parts = re.split(r"(?:^|,\s*)([A-F]):\s*", m.group(1).strip())
+    return text[: m.start()].strip(), {k: v.strip() for k, v in zip(parts[1::2], parts[2::2])}
+
+
 def mmstar(split="val"):
-    """MMStar: one multiple-choice question per image; options parsed from 'Options: A: ..., B: ...'."""
+    """MMStar: one multiple-choice question per image."""
     skipped = 0
     for ex in load_dataset("Lin-Chen/MMStar", split=split):
-        m = re.search(r"\nOptions:\s*(.*)$", ex["question"], re.S)
-        parts = re.split(r"(?:^|,\s*)([A-F]):\s*", m.group(1).strip()) if m else []
-        opts = {k: v.strip() for k, v in zip(parts[1::2], parts[2::2])}
+        instructions, opts = _mmstar_question(ex["question"])
         if len(opts) < 2 or ex["answer"] not in opts:
             skipped += 1
             continue
-        q = {"type": "choice", "instructions": ex["question"][: m.start()].strip(), "criteria": opts}
+        q = {"type": "choice", "instructions": instructions, "criteria": opts}
         yield {"state": "Look at the image.", "images": [_cap_image(ex["image"])], "questions": {"q": q}}, ex["answer"]
     if skipped:
         print(f"mmstar: skipped {skipped} questions whose options could not be parsed")
