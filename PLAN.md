@@ -2,7 +2,7 @@
 
 Companion to `README.md` (the design brief). This plan turns that brief into a buildable project on **`Qwen/Qwen3.5-0.8B-Base`**, and records where the backbone forces changes to the brief.
 
-> **Status (2026-09-24):** M0 ✅ done (gradient-through-cache deferred with training). M1 🟡 inference slice done: typed `predict()`, zero-shot and `<|read|>`-head scorers, invariance tests, zero-shot baselines. M2 ⏸ on hold (inference-only scope). M3 has metrics only. M4 and M5 not started. Details and numbers are in README "Project status"; next steps are at the end of this file.
+> **Status (2026-11-13):** M0 ✅ done (gradient-through-cache deferred with training), and now also verified on an L4 (sm89) once fla's TF32 is turned off for fp32. M1 🟡 inference slice done: typed `predict()`, zero-shot and `<|read|>`-head scorers, invariance tests, zero-shot baselines (GPU run at n = 500 on 6 datasets, plus Gemini Decisions API as a hosted reference). M2 ⏸ on hold (inference-only scope). M3 has metrics only. M4 and M5 not started. Details and numbers are in README "Project status"; next steps are at the end of this file.
 
 ---
 
@@ -83,6 +83,7 @@ Retire the architectural risk before writing anything else.
 **Outcome (✅ go):**
 - Steps 1–3: done. Fork vs. full forward on real weights: 4.8e-5 (Mac CPU fallback) and 2.3e-5 (RTX 2080 Ti, fla, fp32); fp16 min cos 0.999998. Negative controls (zeroed recurrent or conv state) diverge by 3–6.
 - Step 5 (on 11 GB instead of 24 GB): 2k-token state × 50 branches takes 0.78 s fp32 / 0.56 s fp16 with `chunk_size=25`, at 5.4 GiB. The fork is 8–19× faster than one forward per branch. Unchunked it OOMs, because every branch row copies the attention KV.
+- L4 rerun (2026-11-13, sm89, fla 0.6.0): fork vs. sequential 2.1e-5 fp32, but only with IEEE fp32. fla's default TF32 gives 2e-2. bf16 min cos 0.99989, which is no worse than bf16 rounding itself. 2k × 50 takes 0.25 s bf16 / 0.69 s fp32 (19–25× faster than sequential), at 3.0 / 5.4 GiB.
 - Step 4: **deferred.** The transformers cache updates DeltaNet state in place (`copy_`), so backward through a forked cache fails. Resolve it when M2 resumes, via fallback A (per-row `[state, branch]` concatenation) or an out-of-place cache.
 
 ## 3. Milestone M1 — packing, heads, inference API (week 1)
@@ -173,6 +174,9 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 |---|---|
 | fla backward doesn't support grads through `initial_state` | Fallback A: per-row `[state, branch]` concatenation (exact, costs O(branches × state)) for training only. Serving still forks. |
 | Expanded caches blow memory at K=200 with long states | **Confirmed** (2k × 50 OOMs on 11 GB). `expand` doesn't help, because the cache update concatenates and materialises the KV. **Mitigated** by `chunk_size`, which keeps memory flat in K. A two-level fork would also cut per-row cost. |
+| fla runs fp32 as TF32 on Ampere+ (Triton default plus a hard-coded `solve_tril` precision) | **Confirmed** on L4 (2e-2 drift). `system_one.kernels.disable_fla_tf32()` for fp32 runs and tests |
+| fla version drift: 0.5.2 won't import on Triton 3.9, and transformers then silently uses torch kernels | Check that `import fla` succeeds before trusting GPU numbers. Pin fla and Triton together |
+| FP8 / MoE reads depend on batch shape (A3B fork vs sequential 1 − cos 6e-3; batch shape alone 4e-3) | **Confirmed**, not a fork bug. MoE real-weight test compares against the measured batch-shape noise. For batch-invariant answers, use bf16 dense or a deterministic serving mode |
 | fla's DeltaNet kernel is slow on pre-Ampere GPUs | Measured on Turing: 64% of GPU time, and slower than the torch path for short branches. Choose the kernel per phase, and benchmark on Ampere+ before optimising. |
 | fla installed but running on CPU | transformers binds fla at import time for any device, and Triton then fails. Hide fla on CPU (`tests/conftest.py`, `Backbone.from_pretrained`). |
 | 0.8B too weak for hard knowledge tasks (MMLU/GPQA) | Expected. Judge it on calibration (confidence drops when out of depth), not raw accuracy. The same code scales to Qwen3.5-2B/4B/9B. |
@@ -191,9 +195,15 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 | 4–5 | M4 | Server + latency curves |
 | 6+ | M5 / RLCD v2 | Multimodal, soft-label training experiments |
 
-## Immediate next steps (updated 2026-09-24)
-1. Recover the dev box GPU (GPU 0 fell off the bus; CUDA init fails until a reboot or reset). Run one GPU job at a time.
-2. On GPU: finish the fp16 benchmark rows, and rerun `scripts/zero_shot_eval.py` at n ≥ 500 on more datasets (ARC-Easy, CommonsenseQA, AG News for large K).
+## Immediate next steps (updated 2026-11-13)
+1. ~~Recover the dev box GPU~~ Superseded: GPU work now runs on an L4 (24 GB, sm89) dev pod.
+2. ~~n = 500 zero-shot run on 6 datasets~~ Done, with Gemini Decision 1 (Google's hosted Decisions API, same question schema) as a reference. Letter-logit is the best local scorer everywhere except SST-5, and Gemini leads by 0.15–0.36 acc with ECE ≤ 0.04 on 4 of 6.
+2a. ~~Larger backbones~~ Done: 9B (bf16) and 35B-A3B (FP8 on an L40S) through `system_one.models`, plus vLLM 0.32 `/v1/systemone` as a second reference. 9B letter is within 0.01–0.06 of Gemini; A3B FP8 isn't better than 9B zero-shot and is 2–3× slower. FP8 (and MoE routing) make reads batch-shape dependent (README).
+2c. ~~Multi-question benchmark~~ Done (RACE, GoEmotions). Decision 1 is the cheapest and fastest per question. The fork beats vLLM on wide fan-out (28 Q: 19 vs 22 ms/question) but not on long states with few questions. 9B has a strong zero-shot `noul` yes-bias (GoEmotions F1 0.12 vs Gemini 0.26): fixing it is the M3 priority.
+2d. ~~Batched requests + M3 calibration~~ Done. Batching makes 9B single-question requests $18–28 per 1M (L4), level with the Gemini APIs. Multiple-choice is already calibrated (T ≈ 1.04); the yes/no bias depends on the task, so it needs per-task calibration or thresholds (GoEmotions F1 0.12 → 0.26, matching Gemini Decision 1), not one global correction.
+2b. Use Gemini Decision 1 as a teacher: its probability distributions are candidate soft labels for the RLCD v2 stage (§4), when training resumes.
 3. M3 on the zero-shot scorers: fit temperature per (type, K-bucket), plus reliability plots and the stress suite (permutation, K scaling, fan-out, empty state).
-4. Two-level fork (state → question cache → answers) and per-phase kernel choice.
-5. When training resumes (M2): pick the gradient path (fallback A or an out-of-place cache), then train `DecisionHeads` + LoRA.
+4. Kernel choice per phase on Ampere+: profile fla vs. torch for short branches on the L4 (bf16), and debug fla 0.6 `fused_recurrent` + `initial_state` (it returned NaN) before considering it for branches.
+5. Two-level fork (state → question cache → answers).
+6. Add a large-K choice dataset (Banking77 / DBpedia-14 / CLINC150) to the zero-shot eval for the K-scaling stress test.
+7. When training resumes (M2): pick the gradient path (fallback A or an out-of-place cache), then train `DecisionHeads` + LoRA.

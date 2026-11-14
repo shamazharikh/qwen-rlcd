@@ -210,3 +210,28 @@ def test_temperature_flattens_distribution(scorers):
     flat = predict(REQUEST, scorers["sum"], temperature=lambda kind, k: 100.0)["department"]
     assert flat.confidence < sharp.confidence
     assert flat.choice == sharp.choice
+
+
+@pytest.mark.parametrize("scorer_cls", ["letter", "sum-pmi"])
+def test_predict_batch_matches_predict(backbone, scorer_cls):
+    """Batched requests (different state lengths, question counts and types) give the same answers as one at a time."""
+    from system_one.predict import predict_batch
+
+    scorer = LetterScorer(backbone) if scorer_cls == "letter" else LikelihoodScorer(backbone, "sum", pmi=True)
+    requests = [
+        REQUEST,
+        {"state": "Short.", "questions": {"n": {"type": "noul", "instructions": "It is short."}}},
+        {"state": "A much longer state " * 12, "questions": dict(list(REQUEST["questions"].items())[:2])},
+    ]
+    batched = predict_batch(requests, scorer)
+    for request, answers in zip(requests, batched):
+        single = predict(request, scorer)
+        for qid, a in single.items():
+            b = answers[qid]
+            for field in ("noul", "score", "confidence"):
+                if hasattr(a, field):
+                    assert abs(getattr(a, field) - getattr(b, field)) < 1e-4, (qid, field)
+            if hasattr(a, "probabilities"):
+                pa = a.probabilities.values() if isinstance(a.probabilities, dict) else a.probabilities
+                pb = b.probabilities.values() if isinstance(b.probabilities, dict) else b.probabilities
+                assert max(abs(x - y) for x, y in zip(pa, pb)) < 1e-4, qid

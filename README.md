@@ -13,12 +13,12 @@ The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md
 | Milestone | Status |
 |---|---|
 | **M0** backbone spike (prefix fork) | ✅ Done. Fork = full forward on real weights (CPU, CUDA + fla, fp32/fp16); 8–19× faster than one forward per branch; chunked branches bound memory. Gradient-through-cache check deferred until training resumes. |
-| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 3 datasets (CPU, n = 100). Remaining: GPU numbers at larger n, two-level fork. |
+| **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 6 datasets (L4, n = 500), with Google's Gemini Decisions API as a hosted reference. Remaining: two-level fork. |
 | **M2** training (LoRA + heads) | ⏸ On hold |
 | **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
 | **M4** serving / **M5** multimodal | Not started |
 
-**Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box.
+**Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box. GPU runs since 2026-11-13 use an NVIDIA L4 (24 GB, sm89) in a Kubernetes dev pod: `pip install uv && uv venv .venv && uv pip install -e '.[dev,eval,cuda]'`.
 
 ### Key design change: prefix-fork instead of a tree mask
 Qwen3.5-0.8B is a hybrid model: 24 layers = **18 Gated DeltaNet (linear attention) + 6 gated full attention**. A tree attention mask (§2.2, §5.4 below) cannot isolate sibling branches inside recurrent layers, so this repo uses **prefix-fork execution** instead:
@@ -67,7 +67,34 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | 4096 | 10 | 895 | 553 | 4.70 | 9976 | 11.2× |
 | 4096 | 200 | 3196 | – | 7.39 | – | – |
 
+### M0 results: GPU (2026-11-13, NVIDIA L4 24 GB, sm89, fla 0.6.0, torch 2.15 / CUDA 13.2, no `causal-conv1d`)
+All tests pass, fast and real-weight, once fla's TF32 is turned off for fp32 (`system_one/kernels.py`, see findings).
+
+| Check | Result |
+|---|---|
+| **Qwen3.5-0.8B-Base, fork vs. sequential, fp32, fla (IEEE)** | max abs diff **2.1e-5** (tolerance 1e-3), min cos 1.000000 |
+| Same, fla with its default TF32 | max abs diff 2.0e-2 (fails) |
+| Same, bf16 | min cos 0.999887. bf16 fork and bf16 sequential are each 0.99993–0.99994 from fp32, so the fork adds no error beyond bf16 rounding |
+
+Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches). The fp32 column uses Triton's default TF32, since the script loads the model directly rather than through `Backbone`.
+
+| state tokens | branches | fork ms bf16 | fork ms fp32 | fork peak GiB bf16 | sequential ms bf16 | speedup (bf16) |
+|---|---|---|---|---|---|---|
+| 512 | 1 | 100 | 118 | 1.48 | 46 | 0.5× |
+| 512 | 10 | 97 | 135 | 1.74 | 457 | 4.7× |
+| 512 | 50 | 150 | 343 | 2.21 | 2332 | 15.6× |
+| 512 | 100 | 256 | 617 | 2.21 | – | – |
+| 2048 | 1 | 137 | 363 | 1.60 | 95 | 0.7× |
+| 2048 | 10 | 139 | 402 | 2.05 | 958 | 6.9× |
+| 2048 | 50 | 247 | 695 | 2.96 | 4805 | 19.4× |
+| 2048 | 100 | 403 | 1099 | 2.96 | – | – |
+
+Unlike Turing, bf16 here is 2–3× faster than fp32 for 50+ branches. With 1 branch the fork is slower than a plain forward, because it pays for a separate prefill.
+
 ### M0 findings
+- **On Ampere+ (sm ≥ 8), fla's "fp32" is really TF32.** Triton runs fp32 `tl.dot` as TF32 by default, and fla 0.6 also hard-codes `input_precision='tf32'` in the gated-delta-rule `solve_tril` kernel (`SOLVE_TRIL_DOT_PRECISION`), so `TRITON_F32_DEFAULT=ieee` alone isn't enough. Together they put fp32 fork and sequential reads 2e-2 apart on an L4. `system_one.kernels.disable_fla_tf32()` sets the env vars and patches that constant. `Backbone.from_pretrained` calls it for fp32 on CUDA, and so does `tests/conftest.py`. The constant has to be patched after `fla.ops` is imported, because faking an sm < 8 capability at import makes Triton build kernels for the wrong arch. Turing never showed this, since it has no TF32.
+- **fla 0.5.2 doesn't import on Triton 3.9** (autotune key `BT` error). transformers then silently falls back to the torch kernels, so a passing fp32 test can mean fla never ran. Check `fla.__version__` imports cleanly before trusting GPU numbers.
+- **fla 0.6.0's `fused_recurrent_gated_delta_rule` with an `initial_state` from `chunk_gated_delta_rule` returned NaN** in a standalone kernel check (S ≥ 64). The cause hasn't been looked into; it may be a state-layout mismatch, since 0.6 kernels have a `STATE_V_FIRST` flag. transformers only calls it for single-token decode, which the fork never does, but keep it in mind before using `fused_recurrent` for short branches.
 - **`DynamicCache.batch_repeat_interleave` can't fork this model** (transformers 5.17). `LinearAttentionLayer` has no such method, and `LinearAttentionAndFullAttentionLayer` inherits `DynamicLayer`'s, which repeats only keys and values. Hence the custom `expand_cache`.
 - **The cache updates DeltaNet state in place** (`copy_`), so backward through a forked cache fails. This only matters for training, which is out of scope for now.
 - **Tiny random models barely use DeltaNet state.** Zeroing it moves reads by only ~1e-4, so tiny-model tests use a 1e-5 tolerance to stay sensitive.
@@ -86,30 +113,157 @@ Benchmark (`scripts/bench_fork.py --chunk-size 25`, 24-token branches, median of
 | `system_one/predict.py` | `predict(request, scorer, temperature=None)` → typed answers: softmax / sigmoid, confidence = 1 − H(p)/log K, score = Σ p_i·i (0-based) |
 | `system_one/metrics.py` | Accuracy, NLL, Brier, ECE-15, and MAE for Score |
 | `tests/test_predict.py` | Schema validation, rendering independent of option order, answer well-formedness, **question/option-order invariance and fan-out = single-question answers for every scorer** (< 1e-5), fork likelihood = unforked likelihood, PMI arithmetic, `<|read|>` fits in the embedding |
-| `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge (choice), BoolQ (noul), SST-5 (score) |
+| `scripts/zero_shot_eval.py` | Zero-shot baselines through `predict` on ARC-Challenge/Easy, CommonsenseQA, AG News (choice), BoolQ (noul), SST-5 (score). `--scorers gemini` adds Google's hosted Decisions API as a reference |
+| `system_one/remote.py` | `GeminiDecisions` (Google Decisions API, `gemini-decision-1`, needs `GEMINI_API_KEY`) and `VllmSystemOne` (vLLM `/v1/systemone`). Same request shape as §5.2; both return this repo's typed answers |
 
 ### M1 results: zero-shot baselines
-`scripts/zero_shot_eval.py --device cpu --limit 100`: Qwen3.5-0.8B-Base, fp32, seed 0. At n = 100, the 95% CI on accuracy is about ±0.09.
+`scripts/zero_shot_eval.py --limit 500` (2026-11-13): Qwen3.5-0.8B-Base, fp32 (IEEE) on an L4, plus `--scorers gemini`. n = 500 random examples per dataset (seed 0), the same examples for every scorer. The 95% CI on accuracy is about ±0.04. Bold = best local scorer per column. Gemini Decision 1 is a hosted model of unknown size, included as a ceiling reference, not a like-for-like baseline. Its yes/no outputs are clamped to [0.01, 0.99].
 
 | dataset (type, K) | scorer | acc | NLL | Brier | ECE-15 | MAE |
 |---|---|---|---|---|---|---|
-| ARC-Challenge (choice, 4–5) | **letter** | **0.60** | **0.92** | **0.50** | 0.16 | – |
-| | sum | 0.32 | 4.01 | 1.12 | 0.47 | – |
-| | mean | 0.40 | 1.38 | 0.74 | 0.11 | – |
-| | sum-pmi | 0.49 | 2.15 | 0.81 | 0.31 | – |
-| | mean-pmi | 0.49 | 1.30 | 0.71 | 0.16 | – |
-| BoolQ (noul) | letter (yes/no logits) | 0.77 | 0.55 | 0.37 | 0.12 | – |
-| | sum / mean | 0.75 | 0.55 | 0.37 | 0.11 | – |
-| | **sum-pmi / mean-pmi** | **0.79** | **0.54** | **0.36** | 0.13 | – |
-| SST-5 (score, 5) | letter | 0.23 | 2.19 | 1.01 | 0.38 | 1.48 |
-| | **sum** | **0.33** | 1.60 | **0.78** | 0.10 | **1.08** |
-| | mean | 0.25 | 1.63 | 0.81 | 0.09 | 1.17 |
-| | sum-pmi | 0.25 | 1.60 | 0.82 | 0.21 | 1.12 |
-| | mean-pmi | 0.25 | **1.59** | 0.79 | **0.03** | 1.17 |
+| ARC-Challenge (choice, 4–5) | **letter** | **0.612** | **0.949** | **0.504** | **0.053** | – |
+| | sum / mean | 0.328 / 0.362 | 3.839 / 1.384 | 1.062 / 0.747 | 0.454 / 0.076 | – |
+| | sum-pmi / mean-pmi | 0.384 / 0.376 | 2.247 / 1.330 | 0.916 / 0.722 | 0.364 / 0.067 | – |
+| | *Gemini Decision 1* | *0.968* | *0.128* | *0.053* | *0.038* | – |
+| ARC-Easy (choice, 4–5) | **letter** | **0.756** | **0.625** | **0.320** | **0.097** | – |
+| | sum / mean | 0.652 / 0.642 | 1.702 / 1.024 | 0.537 / 0.552 | 0.167 / 0.197 | – |
+| | sum-pmi / mean-pmi | 0.598 / 0.584 | 1.308 / 1.089 | 0.579 / 0.590 | 0.183 / 0.177 | – |
+| | *Gemini Decision 1* | *0.990* | *0.058* | *0.018* | *0.035* | – |
+| CommonsenseQA (choice, 5) | letter | **0.496** | **1.245** | **0.625** | **0.056** | – |
+| | sum / mean | 0.382 / 0.440 | 2.151 / 1.369 | 0.894 / 0.695 | 0.332 / **0.056** | – |
+| | sum-pmi / mean-pmi | 0.484 / **0.496** | 1.539 / 1.326 | 0.712 / 0.675 | 0.203 / 0.127 | – |
+| | *Gemini Decision 1* | *0.860* | *0.387* | *0.195* | *0.093* | – |
+| AG News (choice, 4) | **letter** | **0.654** | **0.859** | **0.466** | 0.136 | – |
+| | sum / mean | 0.562 / 0.376 | 2.157 / 1.282 | 0.661 / 0.695 | 0.226 / 0.161 | – |
+| | sum-pmi / mean-pmi | 0.566 / 0.572 | 1.601 / 1.001 | 0.721 / 0.560 | 0.321 / **0.096** | – |
+| | *Gemini Decision 1* | *0.890* | *0.321* | *0.167* | *0.020* | – |
+| BoolQ (noul) | letter (yes/no logits) | **0.770** | **0.540** | **0.359** | 0.107 | – |
+| | sum = mean | 0.758 | 0.541 | 0.360 | **0.093** | – |
+| | sum-pmi = mean-pmi | 0.760 | 0.546 | 0.365 | 0.099 | – |
+| | *Gemini Decision 1* | *0.926* | *0.220* | *0.125* | *0.021* | – |
+| SST-5 (score, 5) | letter | 0.202 | 2.215 | 1.012 | 0.392 | 1.437 |
+| | sum / mean | 0.272 / 0.186 | 1.640 / 1.655 | 0.797 / 0.819 | **0.066** / 0.089 | **1.084** / 1.121 |
+| | sum-pmi / mean-pmi | **0.306** / 0.304 | **1.568** / 1.585 | 0.791 / **0.790** | 0.138 / 0.082 | 1.102 / 1.122 |
+| | *Gemini Decision 1* | *0.542* | *0.952* | *0.567* | *0.091* | *0.501* |
 
-- No single zero-shot scorer wins: letter-logit is clearly best on knowledge MC (ARC) and worst on ordinal sentiment (SST-5). Summed likelihood shows the expected length and prior bias on ARC (NLL 4.0), and PMI recovers a lot of it.
-- SST-5 is weak for every scorer (≤ 0.33 acc against 0.2 chance). That's the case trained Score heads (M2) need to beat.
-- CPU cost is 1.4–5.5 s per example (PMI runs two forks). Rerun on GPU with n ≥ 500 before drawing finer conclusions.
+- **Letter-logit is the best local scorer on every choice dataset**, and on BoolQ too, now that n = 500 tightens the CI. At n = 100, PMI looked best on BoolQ (0.79), but at n = 500 all scorers are within 0.012 there.
+- **PMI helps only where the answer prior is skewed.** On SST-5 it is the best local scorer (0.31 acc). On ARC it recovers summed likelihood's length bias (NLL 3.84 → 2.25) but still trails letter-logit by 0.23.
+- **The gap to Gemini is large on knowledge tasks** (ARC-Challenge 0.61 vs 0.97) and smaller on BoolQ (0.77 vs 0.93). SST-5 is hard for both (0.31 vs 0.54), so trained Score heads (M2) should be judged against that ceiling, not against 1.0.
+- **Gemini is well calibrated out of the box** (ECE ≤ 0.04 on 4 of 6). The local scorers' ECE ranges from 0.05 to 0.39, which is the case for the M3 temperature fitting.
+- Local cost on the L4 in fp32: 0.09–0.12 s/example (0.20–0.23 s for PMI, which runs two forks). Gemini: 0.09 s/example wall time with 8 concurrent requests.
+- The earlier CPU n = 100 numbers are in git history (`8270d63`).
+
+### Larger backbones, vLLM and Gemini (n = 500, 2026-11-13)
+Same 500 examples per dataset (seed 0) for every column. Cells are accuracy / NLL / ECE-15. Our models use the `letter` scorer (the best or within 0.01 of the best local scorer, except SST-5 and BoolQ, noted below). 9B ran in bf16 on an L4, and 35B-A3B in FP8 (`quantization="fp8"`, the default) on an L40S. vLLM 0.32 `POST /v1/systemone` served the same Base checkpoints (bf16, L4), one request at a time.
+
+| dataset | 0.8B | 9B | 35B-A3B (FP8) | vLLM 0.8B | vLLM 9B | Gemini Decision 1 |
+|---|---|---|---|---|---|---|
+| ARC-Challenge | 0.612 / 0.95 / 0.053 | 0.928 / 0.22 / 0.040 | **0.948** / 0.20 / 0.028 | 0.462 / 1.29 / 0.164 | 0.928 / 0.21 / 0.029 | *0.968 / 0.13 / 0.038* |
+| ARC-Easy | 0.756 / 0.62 / 0.097 | 0.982 / 0.09 / 0.048 | 0.982 / 0.09 / 0.043 | 0.626 / 0.92 / 0.067 | **0.984** / 0.06 / 0.019 | *0.990 / 0.06 / 0.035* |
+| CommonsenseQA | 0.496 / 1.25 / 0.056 | 0.816 / 0.53 / 0.059 | 0.812 / 0.54 / 0.042 | 0.416 / 1.45 / 0.105 | **0.822** / 0.49 / 0.054 | *0.860 / 0.39 / 0.093* |
+| AG News | 0.654 / 0.86 / 0.136 | **0.870** / 0.42 / 0.064 | 0.822 / 0.49 / 0.073 | 0.738 / 0.72 / 0.136 | 0.860 / 0.52 / 0.101 | *0.890 / 0.32 / 0.020* |
+| BoolQ | 0.770 / 0.54 / 0.107 | 0.886 / 0.27 / 0.028 | **0.894** / 0.26 / 0.035 | 0.762 / 0.48 / 0.044 | 0.886 / 0.29 / 0.024 | *0.926 / 0.22 / 0.021* |
+| SST-5 (MAE) | 0.202 / 2.22 / 0.392 (1.44) | 0.480 / 1.19 / 0.153 (0.57) | 0.418 / 1.45 / 0.267 (0.62) | 0.238 / 1.91 / 0.264 (1.24) | **0.500** / 1.11 / 0.075 (0.58) | *0.542 / 0.95 / 0.091 (0.50)* |
+| s/example | 0.09–0.10 (fp32) | 0.17–0.19 | 0.35–0.57 | 0.03–0.04 | 0.09–0.11 | 0.09 (8 concurrent) |
+
+Other local scorers that beat `letter`: SST-5 sum-pmi 0.306 (0.8B) / 0.484 (9B), sum 0.500 (A3B); BoolQ sum 0.894 (9B) / 0.898 (A3B).
+
+- **9B gets within 0.01–0.06 of Gemini zero-shot** and is mostly well calibrated (ECE 0.03–0.06, except SST-5). It's the practical pick: 35B-A3B (FP8) beats it only on ARC-Challenge (+0.02, inside the ±0.04 CI), trails on AG News (−0.05) and SST-5 letter, and runs 2–3× slower here (eager FP8 MoE in transformers, no fused kernels; 40 layers vs 32).
+- **vLLM `/v1/systemone` is the same idea as `letter`** (one read of a single label token, softmax over labels) with a different prompt: chat template with thinking off, options as `A: name - description`. At 9B the two are tied on every dataset (±0.02), with vLLM slightly better calibrated. At 0.8B ours wins on knowledge MC by 0.08–0.15 and vLLM wins on AG News by 0.08: the small model is prompt-sensitive, the 9B isn't.
+- **vLLM is ~2× faster per single-question request** (9B: 0.1 s vs 0.18 s, both bf16): CUDA graphs and fused kernels vs our eager path. These runs have one question per state, so they don't exercise the fork's advantage (one state prefill shared by many questions), nor vLLM's limits (64 questions, 26 options, 10 levels, one read per question). A many-questions-per-state benchmark is the next comparison.
+- Benchmarks (`bench_fork.py --chunk-size 10`, 24-token branches): 9B bf16 on L4, 2048 × 50 branches in 1.47 s at 16.4 GiB, 8.7× faster than sequential at 10 branches. 35B-A3B FP8 on L40S, 2048 × 50 in 1.02 s at 33.7 GiB, 5.1× at 10 branches.
+
+**FP8 and MoE make reads depend on batch shape.** On real 35B-A3B weights (FP8), fork vs sequential reads differ by 1 − cos = 6.1e-3, against ~1e-4 for the dense models in bf16. A diagnostic (router top-8 at each read token, L40S) shows the fork is not the cause:
+
+| comparison (A3B, FP8) | 1 − cos | layers with an expert flip (of 40) |
+|---|---|---|
+| batched fork vs sequential | 2.5e-3 – 6.1e-3 | 11–14 |
+| single-branch fork vs sequential (cache only) | 1.0e-3 – 3.5e-3 | 6–16 |
+| batched vs single-branch fork (batch shape only) | 2.1e-3 – 4.2e-3 | 12–18 |
+| sequential vs sequential | 0 | 0 |
+
+Changing only the batch shape moves reads as much as the fork does, and identical shapes are bit-exact. The source is FP8: dense models in FP8 already drift 17–18× more than in bf16 (fork vs sequential 1 − cos: 0.8B 2.7e-3, 9B 1.7e-3, vs 1.5e-4 / 1.0e-4 in bf16), because quantizing activations to coarse steps turns rounding-level differences into step-sized jumps. MoE then flips about one of the top-8 experts in a third of the layers. Next-token distributions move by 0.04–0.09 total variation, enough to flip near-tied answers. The real-weight test therefore checks MoE models against their own batch-shape noise (fork within 3× of batched-vs-single-branch fork) instead of a fixed cosine. For batch-invariant FP8/MoE answers, a deterministic serving mode would be needed (vLLM has `VLLM_BATCH_INVARIANT=1`).
+
+### 9B vs Gemini chat-completion baselines, with cost per call (n = 500, 2026-11-14)
+Same examples as above. Gemini 2.5 Flash-Lite and 3.1 Flash-Lite run through Gemini's OpenAI-compatible `/chat/completions` (`--scorers chat:<model>`, `system_one/chat.py`): lettered options, "answer with the letter only", temperature 0, no thinking tokens used. That endpoint rejects `logprobs`, so the chat models return hard labels only, with no probabilities or calibration. API scorers ran with 16 concurrent requests.
+
+| dataset | 9B `letter` (fork) | vLLM 9B (16 concurrent) | Gemini 2.5 Flash-Lite (chat) | Gemini 3.1 Flash-Lite (chat) | Gemini Decision 1 |
+|---|---|---|---|---|---|
+| ARC-Challenge | 0.928 | 0.928 | 0.932 | 0.964 | **0.968** |
+| ARC-Easy | 0.982 | 0.982 | 0.972 | **0.992** | 0.990 |
+| CommonsenseQA | 0.816 | 0.814 | 0.810 | **0.870** | 0.860 |
+| AG News | 0.870 | 0.854 | 0.806 | 0.872 | **0.890** |
+| BoolQ | 0.886 | 0.878 | 0.892 | 0.900 | **0.926** |
+| SST-5 (MAE) | 0.480 (0.57) | 0.490 (0.58) | 0.528 (0.54) | **0.574 (0.46)** | 0.542 (0.50) |
+| probabilities (ECE-15) | yes (0.03–0.15) | yes (0.02–0.09) | no | no | yes (0.02–0.09) |
+| **$ per 1M calls** | 45–52 (1 at a time) | **8–15** (mean 10) | **9–18** | 23–45 | 13–22 |
+
+Cost per call: self-hosted = on-demand price ÷ 3600 × wall-clock seconds per call (L4 g6.2xlarge $0.9776/h). APIs = billed prompt and completion tokens × Google list price (2.5 Flash-Lite $0.10 / $0.40 per M, 3.1 Flash-Lite $0.25 / $1.50, Decision 1 $0.10 input only). Per-dataset spread comes mostly from input length (BoolQ passages are longest).
+
+- **Concurrency matters for self-hosting.** vLLM 9B goes from $24.5 per 1M calls one at a time to $15.8 with 4 concurrent and $10.0 with 16 (0.03–0.06 s per call), with unchanged accuracy (±0.01). That's on par with 2.5 Flash-Lite and below Decision 1, on an on-demand L4 (spot or reserved is 20–37% cheaper). Our fork still serves one request at a time; batching requests is the obvious next step (prefill states together, then run all requests' branches in one batch).
+- **3.1 Flash-Lite is the most accurate chat baseline** (best on SST-5, CommonsenseQA and ARC-Easy) but costs 2–3× more than 2.5 Flash-Lite or Decision 1, and gives no confidence to threshold on.
+- **9B (zero-shot) ≈ 2.5 Flash-Lite on accuracy** (−0.05 to +0.06 per dataset) and adds calibrated probabilities. Gemini Decision 1 stays the best accuracy-per-dollar API with probabilities.
+- Real Decision 1 billing is about 2× a token estimate made with the Qwen tokenizer: 125–220 billed tokens per call vs ~70 counted.
+- One SST-5 review per chat model was safety-blocked (`finish_reason` not `stop`) and is scored wrong.
+
+### Multi-question requests (2026-11-14)
+Two datasets put several questions on one state (`zero_shot_eval.py --datasets race,go_emotions --limit 200`): **RACE** (an exam passage of ~400 tokens with 3–6 multiple-choice questions, 702 questions over 200 passages) and **GoEmotions** (a short Reddit comment with 28 yes/no questions, one per emotion, 5,600 questions over 200 comments). This is where the serving designs differ:
+
+- **Our fork:** one state prefill, then every question is a branch in one batch.
+- **Gemini Decision 1:** all questions in one call (up to 1,000).
+- **vLLM `/v1/systemone`:** all questions in one call (up to 64), one read each.
+- **Chat baselines:** one call per question, resending the state every time.
+
+| scorer | RACE acc (ECE) | RACE ms/question | RACE $ per 1M requests | GoEmotions F1 (acc) | GoEmotions ms/question | GoEmotions $ per 1M requests |
+|---|---|---|---|---|---|---|
+| 9B `letter`, our fork (1 at a time, L4) | 0.930 (0.040) | 166 | $158 | 0.121 (0.497) | **19** | $145 |
+| vLLM 9B, 1 at a time (L4) | 0.919 (0.030) | 142 | $135 | 0.139 (0.601) | 23 | $178 |
+| vLLM 9B, 16 concurrent (L4) | 0.919 (0.032) | 130 | $124 | 0.139 (0.600) | 22 | $164 |
+| Gemini Decision 1 (16 concurrent) | 0.942 (0.040) | **11** | **$70** | **0.259** (0.853) | **1.1** | **$129** |
+| Gemini 2.5 Flash-Lite, chat (16 concurrent) | 0.925 (–) | 54 | $153 | 0.218 (0.844) | 53 | $160 |
+| Gemini 3.1 Flash-Lite, chat (16 concurrent) | **0.946** (–) | 50 | $384 | 0.226 (0.833) | 49 | $414 |
+
+ms/question is wall time per request ÷ questions per request. Self-hosted $ = L4 on-demand $0.9776/h × wall time; API $ = billed tokens × list price. GoEmotions is 4.25% positive, so answering "no" everywhere scores 0.958 accuracy with F1 0: **F1 is the metric there** (base-rate guessing gives ≈ 0.04).
+
+- **Asking all questions in one call is what makes Decision 1 cheap.** The chat models resend the RACE passage with every question, so they cost 2.2× (2.5 Flash-Lite) and 5.5× (3.1 Flash-Lite) as much as one Decision 1 call. On GoEmotions the comments are short, so resending them is cheap: 2.5 Flash-Lite costs only 1.2× Decision 1, which bills its 28 question texts (~650 tokens per request).
+- **Wide fan-out is where the fork wins locally.** With 28 questions on a short state, the fork's batched branches cost 19 ms per question, 15–20% less than vLLM (22–23 ms), even though vLLM has CUDA graphs and the fork runs one request at a time in eager mode. On RACE (long state, 3.5 questions) vLLM is cheaper (130–142 vs 166 ms per question). There the fork's chunked prefill and eager kernels dominate, while vLLM's prefix cache shares the passage across the request's questions too.
+- **vLLM's concurrency barely helps here** (−5–8%): each request already fans out into 3–28 reads, so 16 sequences saturate the L4. On single-question requests it cut cost 2.5× (previous section).
+- **9B zero-shot has a "yes" bias on GoEmotions** (accuracy 0.50–0.60 means it says yes to 40–50% of emotions; F1 0.12–0.14). Gemini models are far better calibrated to the base rate (F1 0.22–0.26). That bias is what trained `noul` heads and temperature fitting (M2/M3) should fix. On RACE, 9B is within 0.01–0.03 of the APIs.
+- Cost of this benchmark run: $0.26 of API calls plus about 27 L4-minutes ($0.44).
+
+### Batched requests in the fork (2026-11-14)
+`Backbone.run_batch` / `predict_batch` prefill several requests' states together (left-padded; DeltaNet layers zero the pad positions, so they never reach the recurrent state), then run all requests' branches in shared batches, each continuing its own cache row with its own padding mask and positions. Batched reads match per-request forks to < 1e-5 (tiny dense and MoE models). A leaky variant without the padding mask diverges by 1.56, so the test is sensitive. `zero_shot_eval.py --batch-requests N --chunk-size C --warmup 32`.
+
+9B `letter` on an L4, 200 requests per dataset, seconds per request ($ per 1M requests at $0.9776/h). Accuracy is identical across settings (±0.01):
+
+| batch × chunk | ARC-Challenge | BoolQ | RACE (3.5 Q) | GoEmotions (28 Q) |
+|---|---|---|---|---|
+| 1 × 32 | 0.163 ($44) | 0.174 ($47) | 0.338 ($92) | 0.539 ($146) |
+| 4 × 16 | 0.073 ($20) | **0.102 ($28)** | **0.332 ($90)** | 0.497 ($135) |
+| 8 × 16 | 0.068 ($19) | 0.102 ($28) | 0.357 ($97) | 0.490 ($133) |
+| 8 × 32 | 0.068 ($18) | 0.103 ($28) | 0.361 ($98) | **0.473 ($128)** |
+| 16 × 16 | **0.066 ($18)** | 0.117 ($32) | 0.418 ($114) | 0.492 ($134) |
+
+- **Single-question requests get 1.7–2.5× cheaper**: 9B on the fork is now $18–28 per 1M requests, level with Gemini Decision 1 ($13–22) and 2.5 Flash-Lite chat ($9–18), and it returns probabilities.
+- **Multi-question requests barely change** (−2% to −12%): one RACE or GoEmotions request already fills the GPU with branches. Batch 4–8 is the sweet spot; 16 slows long states down.
+- **Chunks must stay at 16–32 rows for 9B on 24 GB.** Each branch row holds its own copy of the DeltaNet recurrent state (tens of MB at 9B), so 64-row chunks ran out of memory next to 18 GB of weights.
+- **Time with a warmup.** Batching creates many new shapes, and the first run of each pays Triton/fla compile and autotune. Without `--warmup`, the first configuration measured looked slower than batch 1.
+
+### Calibration and the zero-shot yes-bias (M3, 2026-11-14)
+`--split calibration` runs each dataset on a held-out split (train or validation), and `--dump-preds` saves per-question probabilities. `scripts/calibrate_eval.py` fits `system_one/calibrate.py` and reports test metrics before and after: a temperature per (type, K-bucket) for choice/score, Platt scaling (scale + bias on the logit) for yes/no, and for yes/no datasets also F1 at the threshold that maximises F1 on the calibration split. 9B, 200 calibration and 500 test requests per dataset:
+
+| 9B | raw | calibration pooled over datasets (equal weight) | per-dataset calibration | F1 at threshold tuned on calibration split |
+|---|---|---|---|---|
+| choice, `letter` (ARC, CSQA, AG News, RACE) | ECE 0.02–0.06 | T = 1.04: no change | small gains (ARC-Easy ECE 0.043 → 0.017) | – |
+| SST-5 `letter` (score) | ECE 0.143 | T = 1.28: ECE 0.079, NLL 1.190 → 1.155 | same | – |
+| GoEmotions `letter` | F1 0.117, ECE 0.221 | **F1 0.257**, ECE 0.080 | F1 0.003 (ECE 0.005, NLL 0.153) | 0.221 |
+| GoEmotions `sum-pmi` | F1 0.185, ECE 0.035 | F1 0.261 | F1 0.023 | **0.264** |
+| BoolQ `letter` | acc 0.892, F1 0.915 | acc 0.848, F1 0.864 (worse) | 0.892 / 0.912 | 0.912 |
+
+- **9B's multiple-choice reads are already calibrated** (fitted T ≈ 1.04). The miscalibration is in yes/no questions and in SST-5's ordinal levels (T = 1.28).
+- **The yes-bias depends on the task.** One yes/no correction shared by all datasets must trade GoEmotions (needs a −2 to −3.6 logit shift) against BoolQ (needs none). Fit per question count it is dominated by GoEmotions' 5,600 questions and drops BoolQ accuracy to 0.71; with datasets weighted equally the shift is −2.1, fixing GoEmotions but costing BoolQ 0.04.
+- **Calibrated probabilities aren't good decisions for rare labels.** Per-dataset Platt makes GoEmotions probabilities nearly perfect (ECE 0.005), but with a 4% base rate almost nothing then crosses 0.5, so F1 drops to 0.003. A decision threshold tuned for F1 on held-out data gives **F1 0.264 (`sum-pmi`), level with Gemini Decision 1 (0.259) and above 2.5 / 3.1 Flash-Lite chat (0.218 / 0.226)**.
+- Practical recipe: report calibrated probabilities (per type, or per task when a few hundred labels exist), and pick decision thresholds per task on held-out data. The deployable defaults are T = 1.04 (choice) and T = 1.28 (score); yes/no needs per-task calibration.
 
 M1 design notes:
 - `forward_branches_all` returns every branch token's hidden state (the likelihood scorers need them). `forward_branches` reads the last one.
@@ -118,7 +272,15 @@ M1 design notes:
 - In the ARC and SST-5 converters, the question or review text is the state, so PMI's empty-state baseline is meaningful.
 
 ### Next steps
-- [ ] Recover the GPU (reboot / `nvidia-smi -r`), then on one GPU: finish the fp16 benchmark rows (4096 × 50+) and rerun `zero_shot_eval.py` at n ≥ 500
+- [x] GPU zero-shot run at n = 500 on 6 datasets (L4), plus the Gemini Decisions API reference
+- [ ] Large-K choice datasets (Banking77 / DBpedia-14 / CLINC150) for the K-scaling test, local, vLLM and Gemini
+- [x] Qwen3.5-9B and 35B-A3B (FP8) backbones, and vLLM `/v1/systemone` comparison (n = 500)
+- [x] Multi-question benchmark (RACE, GoEmotions): fork vs vLLM `/v1/systemone` vs Gemini Decision 1 vs chat baselines
+- [x] Batch requests in the fork (1.7–2.5× cheaper single-question requests)
+- [ ] CUDA graphs / fused kernels for the fork; latency vs #questions at 512–32k-token states (README §7.8)
+- [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
+- [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
+- [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B
 - [ ] Two-level fork (state → question cache → answers), so long question prefixes aren't recomputed per option (PLAN.md §6)
 - [ ] Kernel choice per phase: fla for the state prefill, and torch or `fused_recurrent` for short branches (recheck on Ampere+)
 - [ ] M3: temperature fitting per (type, K-bucket) on the zero-shot scorers, plus the stress suite (permutation, K scaling, fan-out, empty state)
