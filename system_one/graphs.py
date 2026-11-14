@@ -233,8 +233,7 @@ class GraphBranchRunner:
 
         if not g.eager and g.graph is None:
             self._capture(g)
-            if not g.eager:
-                self._fill_cache(src, idx, rows, src_len, state)  # warmup/capture ran the forward and mutated states
+            self._fill_cache(src, idx, rows, src_len, state)  # warmup (and a failed capture) mutated the states
         if g.eager:
             hidden = self._forward(g)  # in-place state updates only touch the buffers, refilled every call
         else:
