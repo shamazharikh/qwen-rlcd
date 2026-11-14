@@ -214,8 +214,8 @@ def pope(split="test"):
 
 def _mmstar_question(text: str):
     """(instructions, {letter: option}) from MMStar's two formats: 'Q\nOptions: A: x, B: y' and
-    'Hint: ...\nQuestion: Q\nChoices:\n(A) x\n(B) y' (MathVista-style)."""
-    m = re.search(r"\nChoices:\s*\n(.*)$", text, re.S)
+    'Hint: ...\nQuestion: Q\n[Choices:\n](A) x\n(B) y' (MathVista-style)."""
+    m = re.search(r"\n(?:Choices:\s*\n)?(?=\(A\))(.*)$", text, re.S)  # '(A) x' lines, with or without 'Choices:'
     if m:
         opts = dict(re.findall(r"^\(([A-F])\)\s*(.+?)\s*$", m.group(1), re.M))
         q = re.search(r"Question:\s*(.*)$", text[: m.start()], re.S)
