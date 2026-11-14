@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from system_one import templates
-from system_one.fork import forward_branches_all, forward_branches_batched, prefill_state, prefill_states
+from system_one.fork import forward_branches_all, forward_branches_batched, forward_sequences, prefill_state, prefill_states
 from system_one.models import load_text_model
 from system_one.schema import Request
 
@@ -29,6 +29,7 @@ class Backbone:
     tokenizer: object
     chunk_size: int | None = 32
     cuda_graphs: bool = False  # replay branch forwards through captured CUDA graphs (system_one/graphs.py)
+    single_pass: bool = True  # requests with one branch run `state + branch` in one forward instead of forking
     _runner: object = field(default=None, init=False, repr=False)
 
     @classmethod
@@ -63,19 +64,37 @@ class Backbone:
 
     def run(self, state_text: str, branches: list[list[int]]) -> list[torch.Tensor]:
         """Prefill `state_text` once and return each branch's hidden states, a list of [len_i, d]."""
-        state_ids = torch.tensor([self.encode(state_text)], device=self.device)
-        cache = prefill_state(self.text_model, state_ids)
-        if self.cuda_graphs:
-            mask = torch.ones_like(state_ids)
-            return self.runner(cache, mask, branches, [0] * len(branches))
-        return forward_branches_all(self.text_model, cache, state_ids.shape[1], branches, self.pad_id, self.chunk_size)
+        return self.run_batch([state_text], [branches])[0]
 
     def run_batch(self, state_texts: list[str], branches: list[list[list[int]]]) -> list[list[torch.Tensor]]:
-        """Several requests at once: states prefilled together (left-padded), then every request's branches in
-        shared batches of `chunk_size` rows. Returns per request a list of [len_i, d] branch hidden states."""
-        if len(state_texts) == 1:
-            return [self.run(state_texts[0], branches[0])]
-        cache, mask = prefill_states(self.text_model, [self.encode(t) for t in state_texts], self.pad_id)
+        """Several requests at once. Returns per request a list of [len_i, d] branch hidden states.
+
+        With `single_pass`, requests with exactly one branch run as `state + branch` sequences, `chunk_size` rows
+        per forward. The rest fork: states prefilled together (left-padded), then every request's branches in
+        shared batches of `chunk_size` rows."""
+        states = [self.encode(t) for t in state_texts]
+        out: list[list[torch.Tensor] | None] = [None] * len(states)
+        singles = [i for i, bs in enumerate(branches) if len(bs) == 1] if self.single_pass else []
+        step = self.chunk_size or len(singles) or 1
+        for start in range(0, len(singles), step):
+            idx = singles[start : start + step]
+            hidden = forward_sequences(self.text_model, [states[i] + branches[i][0] for i in idx], self.pad_id)
+            for i, h in zip(idx, hidden):
+                out[i] = [h[-len(branches[i][0]) :]]
+        forked = [i for i in range(len(states)) if out[i] is None]
+        if forked:
+            for i, h in zip(forked, self._fork([states[i] for i in forked], [branches[i] for i in forked])):
+                out[i] = h
+        return out
+
+    def _fork(self, states: list[list[int]], branches: list[list[list[int]]]) -> list[list[torch.Tensor]]:
+        if len(states) == 1:
+            state_ids = torch.tensor([states[0]], device=self.device)
+            cache = prefill_state(self.text_model, state_ids)
+            if self.cuda_graphs:
+                return [self.runner(cache, torch.ones_like(state_ids), branches[0], [0] * len(branches[0]))]
+            return [forward_branches_all(self.text_model, cache, state_ids.shape[1], branches[0], self.pad_id, self.chunk_size)]
+        cache, mask = prefill_states(self.text_model, states, self.pad_id)
         flat = [b for bs in branches for b in bs]
         rows = [r for r, bs in enumerate(branches) for _ in bs]
         if self.cuda_graphs:
