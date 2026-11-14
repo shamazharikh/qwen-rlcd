@@ -18,7 +18,8 @@ from torch import nn
 
 from system_one import templates
 from system_one.fork import forward_branches_all, forward_branches_batched, forward_sequences, prefill_state, prefill_states
-from system_one.models import load_text_model
+from system_one.models import load_model
+from system_one.multimodal import MediaConfig
 from system_one.schema import Request
 
 
@@ -30,14 +31,27 @@ class Backbone:
     chunk_size: int | None = 32
     cuda_graphs: bool = False  # replay branch forwards through captured CUDA graphs (system_one/graphs.py)
     single_pass: bool = True  # requests with one branch run `state + branch` in one forward instead of forking
+    vlm: nn.Module | None = None  # Qwen3_5Model (vision tower + this text model), for images/videos in the state
+    processor: object | None = None
+    media: MediaConfig = field(default_factory=MediaConfig)
     _runner: object = field(default=None, init=False, repr=False)
+    last_media_stats: dict = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
-    def from_pretrained(cls, repo: str = "0.8b", dtype=None, device=None, device_map=None, quantization="default", **kwargs):
+    def from_pretrained(
+        cls, repo: str = "0.8b", dtype=None, device=None, device_map=None, quantization="default", vision=False, **kwargs
+    ):
         """`repo`: an alias from `system_one.models.MODELS` (`0.8b`, `9b`, `35b-a3b`) or an HF repo id.
-        `dtype=None` picks fp32 for 0.8B and bf16 (fp16 pre-Ampere) for the larger models."""
-        text_model, lm_head, tokenizer = load_text_model(repo, dtype, device, device_map, quantization)
-        return cls(text_model, lm_head, tokenizer, **kwargs)
+        `dtype=None` picks fp32 for 0.8B and bf16 (fp16 pre-Ampere) for the larger models.
+        `vision=True` puts the vision tower on the device and loads the processor, for requests with media."""
+        full, tokenizer = load_model(repo, dtype, device, device_map, quantization, vision=vision)
+        if vision:
+            from transformers import AutoProcessor
+
+            from system_one.models import resolve
+
+            kwargs.update(vlm=full.model, processor=AutoProcessor.from_pretrained(resolve(repo)))
+        return cls(full.model.language_model, full.lm_head, tokenizer, **kwargs)
 
     @property
     def pad_id(self) -> int:
@@ -62,30 +76,54 @@ class Backbone:
     def encode(self, text: str) -> list[int]:
         return self.tokenizer(text, add_special_tokens=False).input_ids
 
-    def run(self, state_text: str, branches: list[list[int]]) -> list[torch.Tensor]:
+    def run(self, state_text: str, branches: list[list[int]], media=None) -> list[torch.Tensor]:
         """Prefill `state_text` once and return each branch's hidden states, a list of [len_i, d]."""
-        return self.run_batch([state_text], [branches])[0]
+        return self.run_batch([state_text], [branches], [media] if media else None)[0]
 
-    def run_batch(self, state_texts: list[str], branches: list[list[list[int]]]) -> list[list[torch.Tensor]]:
+    def run_batch(
+        self, state_texts: list[str], branches: list[list[list[int]]], media: list | None = None
+    ) -> list[list[torch.Tensor]]:
         """Several requests at once. Returns per request a list of [len_i, d] branch hidden states.
 
-        With `single_pass`, requests with exactly one branch run as `state + branch` sequences, `chunk_size` rows
-        per forward. The rest fork: states prefilled together (left-padded), then every request's branches in
-        shared batches of `chunk_size` rows."""
-        states = [self.encode(t) for t in state_texts]
-        out: list[list[torch.Tensor] | None] = [None] * len(states)
-        singles = [i for i, bs in enumerate(branches) if len(bs) == 1] if self.single_pass else []
+        `state_texts` are raw state strings (rendered here). `media`: per request `(images, videos)` or None.
+        Requests with media run one at a time through `_run_media`. With `single_pass`, text requests with
+        exactly one branch run as `state + branch` sequences, `chunk_size` rows per forward. The rest fork:
+        states prefilled together (left-padded), then every request's branches in shared batches of
+        `chunk_size` rows."""
+        media = media or [None] * len(state_texts)
+        out: list[list[torch.Tensor] | None] = [None] * len(state_texts)
+        for i, m in enumerate(media):
+            if m and (m[0] or m[1]):
+                out[i] = self._run_media(state_texts[i], branches[i], *m)
+        states = [self.encode(templates.render_state(t)) if out[i] is None else None for i, t in enumerate(state_texts)]
+        singles = [i for i, bs in enumerate(branches) if len(bs) == 1 and out[i] is None] if self.single_pass else []
         step = self.chunk_size or len(singles) or 1
         for start in range(0, len(singles), step):
             idx = singles[start : start + step]
             hidden = forward_sequences(self.text_model, [states[i] + branches[i][0] for i in idx], self.pad_id)
             for i, h in zip(idx, hidden):
                 out[i] = [h[-len(branches[i][0]) :]]
-        forked = [i for i in range(len(states)) if out[i] is None]
+        forked = [i for i in range(len(state_texts)) if out[i] is None]
         if forked:
             for i, h in zip(forked, self._fork([states[i] for i in forked], [branches[i] for i in forked])):
                 out[i] = h
         return out
+
+    def _run_media(self, state_text: str, branches: list[list[int]], images, videos) -> list[torch.Tensor]:
+        from system_one import multimodal
+
+        if self.vlm is None:
+            raise ValueError("request has images/videos: load the backbone with vision=True")
+        state = multimodal.encode_state(self.vlm, self.processor, state_text, images, videos, self.media)
+        self.last_media_stats = {"state_tokens": state.embeds.shape[1], "vision_tokens": state.vision_tokens,
+                                 "pruned_tokens": state.pruned_tokens}  # fmt: skip
+        if self.single_pass and len(branches) == 1:
+            return [multimodal.forward_with_branch(self.text_model, state, branches[0])]
+        cache = multimodal.prefill(self.text_model, state)
+        n = state.embeds.shape[1]
+        return forward_branches_all(
+            self.text_model, cache, n, branches, self.pad_id, self.chunk_size, start_position=state.next_position
+        )
 
     def _fork(self, states: list[list[int]], branches: list[list[list[int]]]) -> list[list[torch.Tensor]]:
         if len(states) == 1:
@@ -134,7 +172,7 @@ class LetterScorer:
     @torch.no_grad()
     def batch(self, requests: list[Request]) -> list[dict[str, torch.Tensor]]:
         branches = [[self.backbone.encode(templates.letter_prompt(q)) for q in r.questions.values()] for r in requests]
-        hidden = self.backbone.run_batch([templates.render_state(r.state) for r in requests], branches)
+        hidden = self.backbone.run_batch([r.state for r in requests], branches, [_media(r) for r in requests])
         return [self._logits(r, h) for r, h in zip(requests, hidden)]
 
     def _logits(self, request: Request, hidden: list[torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -166,7 +204,7 @@ class LikelihoodScorer:
         return items
 
     def _answer_scores(self, state: str, items) -> torch.Tensor:
-        return self._scores(items, self.backbone.run(templates.render_state(state), [ids for _, _, ids in items]))
+        return self._scores(items, self.backbone.run(state, [ids for _, _, ids in items]))
 
     def _scores(self, items, hidden) -> torch.Tensor:
         scores = []
@@ -186,10 +224,10 @@ class LikelihoodScorer:
     def batch(self, requests: list[Request]) -> list[dict[str, torch.Tensor]]:
         items = [self._branches(r) for r in requests]
         branches = [[ids for _, _, ids in it] for it in items]
-        hidden = self.backbone.run_batch([templates.render_state(r.state) for r in requests], branches)
+        hidden = self.backbone.run_batch([r.state for r in requests], branches, [_media(r) for r in requests])
         scores = [self._scores(it, h) for it, h in zip(items, hidden)]
-        if self.pmi:  # same branches under an empty state
-            empty = self.backbone.run_batch([templates.render_state("")] * len(requests), branches)
+        if self.pmi:  # same branches under an empty state (no text, no media)
+            empty = self.backbone.run_batch([""] * len(requests), branches)
             scores = [s - self._scores(it, h) for s, it, h in zip(scores, items, empty)]
         return [_group(r, [qid for qid, _, _ in it], s) for r, it, s in zip(requests, items, scores)]
 
@@ -229,7 +267,7 @@ class HeadScorer:
             for answer in answers:
                 qids.append(qid)
                 branches.append(prefix + (self.backbone.encode(answer) if answer else []) + [self.read_id])
-        hidden = self.backbone.run(templates.render_state(request.state), branches)
+        hidden = self.backbone.run(request.state, branches, _media(request))
         reads = torch.stack([h[-1] for h in hidden]).to(self.heads.option_head.weight.dtype)
         option_logits = self.heads.option_head(reads).squeeze(-1).float()
         noul_logits = self.heads.noul_head(reads).squeeze(-1).float()
@@ -238,6 +276,10 @@ class HeadScorer:
             if q.type == "noul":
                 out[qid] = noul_logits[qids.index(qid)]
         return out
+
+
+def _media(request: Request):
+    return (request.images, request.videos) if request.has_media else None
 
 
 def _group(request: Request, qids: list[str], scores: torch.Tensor) -> dict[str, torch.Tensor]:

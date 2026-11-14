@@ -14,15 +14,33 @@ differ in latency and cost:
 - `race`: an exam passage with 3-6 multiple-choice questions (long state, few questions).
 - `go_emotions`: a comment with 28 yes/no emotion questions (short state, wide fan-out; reports binary F1).
 
+Image and short-video datasets (PLAN.md M5) put the media in the state and every question about it in one request:
+
+- `pope`: COCO images, ~18 yes/no object-presence questions each (random/popular/adversarial sampling).
+- `mmstar`: one multiple-choice question per image, checked to need the image.
+- `tempcompass_mc` / `tempcompass_yn`: ~10-30 s clips with temporal multiple-choice + caption-matching / yes-no questions.
+- `nextqa`: NExT-QA multiple choice (5 options) on clips of at most 60 s, ~8 questions per clip.
+
+Videos are transcoded once to <= 448 px (ffmpeg, cached) and images capped at 1 MP before any scorer sees them,
+so the fork and vLLM read identical pixels. `--video-pruning-rate` turns on EVS in the fork; start vLLM with the
+same `--video-pruning-rate` and `--media-io-kwargs '{"video": {"fps": 2, "num_frames": 32}}'`.
+
+    python scripts/zero_shot_eval.py --model 9b --scorers letter --datasets pope,mmstar,tempcompass_mc --limit 200
+
     python scripts/zero_shot_eval.py --datasets race,go_emotions --limit 200 --gpu-usd-per-hour 0.9776
 
 Metrics pool every question in a dataset. Prints a markdown table per dataset and scorer.
 """
 
 import argparse
+import glob
 import json
+import os
 import random
+import re
+import subprocess
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -120,11 +138,159 @@ def go_emotions(split="test"):
         yield {"state": ex["text"], "questions": questions}, {n: int(i in ex["labels"]) for i, n in enumerate(names)}
 
 
-MULTI_QUESTION = {"race", "go_emotions"}
+# ---- images and short videos (M5) ----------------------------------------------------------------------------
+
+MEDIA_ROOT = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "qwen_rlcd_media")
+IMAGE_MAX_PIXELS = 1024 * 1024
+VIDEO_MAX_SIDE = 448
+
+
+def _cap_image(img):
+    img = img.convert("RGB")
+    w, h = img.size
+    scale = (IMAGE_MAX_PIXELS / (w * h)) ** 0.5
+    return img if scale >= 1 else img.resize((max(1, int(w * scale)), max(1, int(h * scale))), resample=3)
+
+
+def _video_index(repo: str, zip_name: str) -> dict[str, str]:
+    """Download and extract a dataset's video zip once; map file stem -> path."""
+    from huggingface_hub import hf_hub_download
+
+    out = os.path.join(MEDIA_ROOT, repo.replace("/", "__"))
+    if not os.path.exists(os.path.join(out, ".done")):
+        with zipfile.ZipFile(hf_hub_download(repo, zip_name, repo_type="dataset")) as z:
+            z.extractall(out)
+        open(os.path.join(out, ".done"), "w").close()
+    paths = [p for ext in ("mp4", "webm", "mkv", "avi") for p in glob.glob(os.path.join(out, "**", f"*.{ext}"), recursive=True)]
+    return {os.path.splitext(os.path.basename(p))[0]: p for p in paths}
+
+
+def prepare_video(path: str) -> str:
+    """Transcode to H.264 with the longer side <= VIDEO_MAX_SIDE (cached), so every scorer reads the same pixels."""
+    out = os.path.join(MEDIA_ROOT, f"transcoded_{VIDEO_MAX_SIDE}", os.path.splitext(os.path.basename(path))[0] + ".mp4")
+    if not os.path.exists(out):
+        import imageio_ffmpeg
+
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        side = VIDEO_MAX_SIDE
+        vf = f"scale='min({side},iw)':'min({side},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", path, "-vf", vf, "-an",
+               "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p", out + ".tmp.mp4"]  # fmt: skip
+        subprocess.run(cmd, check=True)
+        os.replace(out + ".tmp.mp4", out)
+    return out
+
+
+def prepare_media(example):
+    request, labels = example
+    if request.get("videos"):
+        request = {**request, "videos": [prepare_video(v) for v in request["videos"]]}
+    return request, labels
+
+
+def _options_from_lines(lines):
+    """'A. text' / 'Option 1: text' / 'Caption A: text' lines -> {key: text}."""
+    opts = {}
+    for line in lines:
+        m = re.match(r"^(?:Option|Sentence|Caption)?\s*([A-Z0-9])[.:]\s*(.+)$", line.strip())
+        if m:
+            opts[m.group(1)] = m.group(2).strip()
+    return opts
+
+
+def pope(split="test"):
+    """POPE: yes/no object-presence questions, one request per COCO image with all its questions."""
+    groups = {}
+    for ex in load_dataset("lmms-lab-encoder/POPE", split=split):
+        img, qs, labels = groups.setdefault(ex["image_source"], [None, {}, {}])
+        if img is None:
+            groups[ex["image_source"]][0] = _cap_image(ex["image"])
+        qid = f"{ex['category']}_{ex['question_id']}"
+        qs[qid] = {"type": "noul", "instructions": ex["question"]}
+        labels[qid] = int(ex["answer"].strip().lower() == "yes")
+    for img, qs, labels in groups.values():
+        yield {"state": "Look at the image.", "images": [img], "questions": qs}, labels
+
+
+def mmstar(split="val"):
+    """MMStar: one multiple-choice question per image; options parsed from 'Options: A: ..., B: ...'."""
+    skipped = 0
+    for ex in load_dataset("Lin-Chen/MMStar", split=split):
+        m = re.search(r"\nOptions:\s*(.*)$", ex["question"], re.S)
+        parts = re.split(r"(?:^|,\s*)([A-F]):\s*", m.group(1).strip()) if m else []
+        opts = {k: v.strip() for k, v in zip(parts[1::2], parts[2::2])}
+        if len(opts) < 2 or ex["answer"] not in opts:
+            skipped += 1
+            continue
+        q = {"type": "choice", "instructions": ex["question"][: m.start()].strip(), "criteria": opts}
+        yield {"state": "Look at the image.", "images": [_cap_image(ex["image"])], "questions": {"q": q}}, ex["answer"]
+    if skipped:
+        print(f"mmstar: skipped {skipped} questions whose options could not be parsed")
+
+
+def _tempcompass(configs, split="test"):
+    repo = "lmms-eval/TempCompass"
+    videos = _video_index(repo, "tempcompass_videos.zip")
+    groups = {}
+    for config in configs:
+        for i, ex in enumerate(load_dataset(repo, config, split=split)):
+            qs, labels = groups.setdefault(ex["video_id"], ({}, {}))
+            qid = f"{config}_{i}"
+            if config == "yes_no":
+                qs[qid] = {"type": "noul", "instructions": ex["question"]}
+                labels[qid] = int(ex["answer"].strip().lower().startswith("yes"))
+                continue
+            lines = ex["question"].split("\n")
+            opts = _options_from_lines(lines[1:])
+            key = next(iter(_options_from_lines([ex["answer"]])), None)
+            if key not in opts:  # answer given as bare option text
+                key = next((k for k, v in opts.items() if v == ex["answer"].strip()), None)
+            if len(opts) < 2 or key is None:
+                continue
+            qs[qid] = {"type": "choice", "instructions": lines[0].strip(), "criteria": opts}
+            labels[qid] = key
+    for vid, (qs, labels) in groups.items():
+        if vid in videos and qs:
+            yield {"state": "Watch the video.", "videos": [videos[vid]], "questions": qs}, labels
+
+
+def tempcompass_mc(split="test"):
+    """TempCompass: temporal multiple-choice and caption-matching questions, one request per clip."""
+    yield from _tempcompass(["multi-choice", "caption_matching"], split)
+
+
+def tempcompass_yn(split="test"):
+    """TempCompass: temporal yes/no questions, one request per clip."""
+    yield from _tempcompass(["yes_no"], split)
+
+
+def nextqa(split="test", max_frames=1800):
+    """NExT-QA multiple choice, one request per clip; only clips of at most `max_frames` frames (~60 s at 30 fps)."""
+    repo = "lmms-eval/NExTQA"
+    videos = _video_index(repo, "videos.zip")
+    groups = {}
+    for ex in load_dataset(repo, "MC", split=split):
+        if ex["frame_count"] > max_frames:
+            continue
+        qs, labels = groups.setdefault(str(ex["video"]), ({}, {}))
+        qid = f"q{ex['qid']}"
+        q = ex["question"].strip()
+        qs[qid] = {"type": "choice", "instructions": q[:1].upper() + q[1:] + "?",
+                   "criteria": {k: ex[f"a{i}"] for i, k in enumerate("ABCDE")}}  # fmt: skip
+        labels[qid] = "ABCDE"[ex["answer"]]
+    for vid, (qs, labels) in groups.items():
+        if vid in videos:
+            yield {"state": "Watch the video.", "videos": [videos[vid]], "questions": qs}, labels
+
+
+MEDIA = {"pope", "mmstar", "tempcompass_mc", "tempcompass_yn", "nextqa"}
+MULTI_QUESTION = {"race", "go_emotions", "pope", "tempcompass_mc", "tempcompass_yn", "nextqa"}
 # Held-out split per dataset for fitting calibration (never the split the test numbers come from).
 CALIBRATION_SPLITS = {
     "arc_challenge": "validation", "arc_easy": "validation", "commonsense_qa": "train", "ag_news": "train",
     "boolq": "train", "sst5": "validation", "race": "validation", "go_emotions": "validation",
+    # The media sets have no labelled held-out split here: calibrate on a disjoint seed's sample instead.
+    "pope": "test", "mmstar": "val", "tempcompass_mc": "test", "tempcompass_yn": "test", "nextqa": "test",
 }  # fmt: skip
 DATASETS = {
     "arc_challenge": arc,
@@ -135,6 +301,11 @@ DATASETS = {
     "sst5": sst5,
     "race": race,
     "go_emotions": go_emotions,
+    "pope": pope,
+    "mmstar": mmstar,
+    "tempcompass_mc": tempcompass_mc,
+    "tempcompass_yn": tempcompass_yn,
+    "nextqa": nextqa,
 }
 
 
@@ -199,6 +370,9 @@ def main():
     parser.add_argument("--batch-requests", type=int, default=1, help="local scorers: requests prefilled and branched together")
     parser.add_argument("--no-single-pass", action="store_true", help="local scorers: fork even for one-question requests")
     parser.add_argument("--cuda-graphs", action="store_true", help="local scorers: replay branch forwards as CUDA graphs")
+    parser.add_argument("--video-pruning-rate", type=float, default=0.0, help="local scorers: EVS q in [0, 1) for video tokens")
+    parser.add_argument("--video-fps", type=float, default=2.0, help="video frames sampled per second (max --video-max-frames)")
+    parser.add_argument("--video-max-frames", type=int, default=32)
     parser.add_argument("--chunk-size", type=int, default=None, help="local scorers: max branch rows per forward (default 32)")
     parser.add_argument("--gpu-usd-per-hour", type=float, default=None, help="local / vllm: GPU price, for $ per 1M requests (L4 g6.2xlarge on-demand: 0.9776)")
     parser.add_argument("--vllm-url", default=None, help="vLLM server for --scorers vllm (default $VLLM_BASE_URL or localhost:8000)")
@@ -206,15 +380,19 @@ def main():
 
     torch.set_grad_enabled(False)
     local = [s for s in args.scorers.split(",") if not is_remote(s)]
+    vision = any(d in MEDIA for d in args.datasets.split(","))
     backbone = Backbone.from_pretrained(
         args.model, dtype=getattr(torch, args.dtype) if args.dtype else None, device=args.device, device_map=args.device_map,
-        quantization=args.quantization,
+        quantization=args.quantization, vision=vision,
     ) if local else None
     if backbone and args.chunk_size:
         backbone.chunk_size = args.chunk_size
     if backbone:
         backbone.cuda_graphs = args.cuda_graphs
         backbone.single_pass = not args.no_single_pass
+        backbone.media.video_pruning_rate = args.video_pruning_rate
+        backbone.media.fps, backbone.media.max_frames = args.video_fps, args.video_max_frames
+        backbone.media.image_max_pixels, backbone.media.video_max_side = IMAGE_MAX_PIXELS, VIDEO_MAX_SIDE
     scorers = {
         "gemini": lambda: GeminiDecisions(),  # hosted reference model; needs GEMINI_API_KEY
         "vllm": lambda: VllmSystemOne(resolve(args.model), args.vllm_url),  # vLLM /v1/systemone serving --model
@@ -232,6 +410,8 @@ def main():
     for name in args.datasets.split(","):
         examples = list(DATASETS[name](CALIBRATION_SPLITS[name]) if args.split == "calibration" else DATASETS[name]())
         examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
+        if name in MEDIA:
+            examples = [prepare_media(e) for e in examples]
         for scorer_name in args.scorers.split(","):
             if args.warmup and not is_remote(scorer_name):  # untimed: Triton/fla compile and autotune per new shape
                 evaluate(examples[: args.warmup], scorers[scorer_name](), 1, args.batch_requests)

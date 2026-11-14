@@ -143,6 +143,7 @@ def forward_branches_all(
     branches: list[list[int]],
     pad_id: int,
     chunk_size: int | None = None,
+    start_position: int | None = None,
 ) -> list[torch.Tensor]:
     """Run `branches` as right-padded batches continuing from `state_cache`.
 
@@ -152,6 +153,8 @@ def forward_branches_all(
 
     Each branch row holds its own copy of the attention-layer KV, so memory grows with
     #branches × state length. `chunk_size` caps the rows per forward; outputs don't depend on it.
+    `start_position`: the branches' first position, when it differs from `state_len` (a multimodal state,
+    whose M-RoPE positions advance by less than one per vision token).
     """
     if any(len(b) == 0 for b in branches):
         raise ValueError("branches must be non-empty")
@@ -159,7 +162,9 @@ def forward_branches_all(
         return [
             h
             for i in range(0, len(branches), chunk_size)
-            for h in forward_branches_all(text_model, state_cache, state_len, branches[i : i + chunk_size], pad_id)
+            for h in forward_branches_all(
+                text_model, state_cache, state_len, branches[i : i + chunk_size], pad_id, start_position=start_position
+            )
         ]
     device = text_model.embed_tokens.weight.device
     n, max_len = len(branches), max(len(b) for b in branches)
@@ -167,7 +172,8 @@ def forward_branches_all(
     for i, b in enumerate(branches):
         input_ids[i, : len(b)] = torch.tensor(b, dtype=torch.long, device=device)
     # Every branch starts at the same position offset, so siblings are position-identical.
-    position_ids = torch.arange(state_len, state_len + max_len, device=device).expand(n, -1)
+    start = state_len if start_position is None else start_position
+    position_ids = torch.arange(start, start + max_len, device=device).expand(n, -1)
     cache = expand_cache(state_cache, n)
     out = text_model(input_ids=input_ids, position_ids=position_ids, past_key_values=cache, use_cache=True)
     return [out.last_hidden_state[i, : len(b)] for i, b in enumerate(branches)]
