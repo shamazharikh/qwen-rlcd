@@ -52,7 +52,10 @@ def test_runner_reuses_shapes_and_grows_capacity(tiny_model):
     _check(tiny_model, runner, *_request(2, (70,), (3,)))  # longer state: buffers regrow
     assert runner.capacity == 96
     if runner.use_graphs:
-        assert runner.captures == 2 and runner.graphs[(4, 16, 96)].graph is not None
+        moe = hasattr(tiny_model.config, "num_experts")
+        # transformers' MoE routing syncs with the host, so MoE models can't be captured and run eagerly instead.
+        assert runner.captures == (0 if moe else 2)
+        assert runner.graphs[(4, 16, 96)].eager == moe
 
 
 def test_runner_single_state_and_long_branch_fallback(tiny_model):
