@@ -16,7 +16,8 @@ The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md
 | **M1** templates, heads, typed API, zero-shot baselines | 🟡 Inference slice done: `predict()` with typed answers, letter / likelihood / PMI / `<|read|>`-head scorers, order and fan-out invariance tests, zero-shot numbers on 6 datasets (L4, n = 500), with Google's Gemini Decisions API as a hosted reference. Remaining: two-level fork. |
 | **M2** training (LoRA + heads) | ⏸ On hold |
 | **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
-| **M4** serving / **M5** multimodal | Not started |
+| **M4** serving | Not started |
+| **M5** multimodal | 🟡 Images and short videos in the state, with EVS video-token pruning; fork numbers on POPE, TempCompass, NExT-QA (see "Images and short videos"). Remaining: full MMStar run, a vLLM media baseline. |
 
 **Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box. GPU runs since 2026-11-13 use an NVIDIA L4 (24 GB, sm89) in a Kubernetes dev pod: `pip install uv && uv venv .venv && uv pip install -e '.[dev,eval,cuda]'`.
 
@@ -249,6 +250,39 @@ ms/question is wall time per request ÷ questions per request. Self-hosted $ = L
 - **Chunks must stay at 16–32 rows for 9B on 24 GB.** Each branch row holds its own copy of the DeltaNet recurrent state (tens of MB at 9B), so 64-row chunks ran out of memory next to 18 GB of weights.
 - **Time with a warmup.** Batching creates many new shapes, and the first run of each pays Triton/fla compile and autotune. Without `--warmup`, the first configuration measured looked slower than batch 1.
 
+### Images and short videos in the state (M5, 2026-11-14)
+`system_one/multimodal.py`: vision features replace the image/video placeholders in the **state**. Positions are Qwen3.5's 3-axis M-RoPE (`get_rope_index`), and every branch continues at the state's next text position on all three axes. Requests take `images` / `videos` (paths, URLs, data URLs; the same field names as vLLM's `/v1/systemone`), and `Backbone.from_pretrained(..., vision=True)` loads the vision tower and processor. Requests with media run one at a time, through the fork or the single pass.
+
+- **Correctness:** fork and single-pass reads with one image, two images, a video, or image + video match transformers' own multimodal forward (which computes positions for the whole sequence) to < 1e-4 on a tiny model with all three M-RoPE axes in use. Starting branches at the token count instead of the M-RoPE next position fails all 8 cases.
+- **Two traps:** the causal mask follows cache indices, so position jumps inside the state are safe. But a 2D or 4-axis text position track that jumps is read by transformers as *packed sequences*, so the state must be prefilled with 3-axis positions only.
+- **EVS** (`--video-pruning-rate q`, vLLM's Efficient Video Sampling): rank video tokens by 1 − cosine similarity to the same patch in the previous temporal group, always keep the first group, keep `max(tokens per group, int(total × (1 − q)))`. Kept tokens keep their unpruned positions, as in vLLM.
+- **Same inputs for every scorer:** video frames are sampled with vLLM's rule (`min(32, floor(duration × 2 fps))` frames at `linspace(0, total − 1, n)`, timestamps from source indices). Sampled videos are transcoded to ≤ 448 px and images capped at 1 MP before any scorer sees them.
+
+9B `letter` on an L40S, 200 requests per dataset (seed 0), one request per image or clip carrying all its questions, $ per 1M requests at $1.861/h:
+
+| dataset | questions | acc | F1 | ECE-15 | s/request | ms/question | $ per 1M requests |
+|---|---|---|---|---|---|---|---|
+| POPE (COCO, ~18 yes/no per image) | 3,600 | 0.908 | 0.906 | 0.025 | 0.21 | 12 | $111 |
+| TempCompass MC + caption matching (10–30 s clips) | 1,515 | 0.777 | – | 0.042 | 0.56 | 74 | $291 |
+| TempCompass yes/no | 1,251 | 0.746 | 0.777 | 0.037 | 0.53 | 84 | $272 |
+| NExT-QA MC (clips ≤ 60 s) | 1,630 | 0.823 | – | 0.021 | 1.15 | 142 | $597 |
+| MMStar (partial, see below) | 200 | 0.700 | – | 0.126 | 0.09 | 93 | $48 |
+
+EVS in the fork (accuracy, s/request):
+
+| dataset | q = 0 | q = 0.5 | q = 0.75 |
+|---|---|---|---|
+| TempCompass MC | 0.777, 0.56 | 0.772, 0.49 | 0.737, 0.47 |
+| TempCompass yes/no | 0.746, 0.53 | 0.761, 0.48 | 0.727, 0.47 |
+| NExT-QA | 0.823, 1.15 | 0.807, 1.05 | 0.801, 0.98 |
+
+- **9B zero-shot sees well.** POPE 0.91 accuracy and F1, with ECE 0.025, so no yes-bias on images, unlike GoEmotions. Probabilities on the video sets are well calibrated too (ECE 0.02–0.04).
+- **EVS at q = 0.5 costs ≤ 0.016 accuracy** (TempCompass yes/no even gains 0.015, inside noise). At q = 0.75 the loss grows to 0.02–0.04.
+- **EVS saves little time here (9–16%) because video decoding dominated, not the model.** The loader decoded and converted every frame to RGB on the CPU and the GPU sat idle much of the time. Converting only the sampled frames (threaded decode) is now 5.7× faster on a 20 s clip with identical frames; these timings predate that fix.
+- **Fan-out pays off on images:** POPE's ~18 questions per image cost 12 ms each after one image prefill.
+- **MMStar is partial:** this run's parser skipped 346 of 1,500 questions, mostly the MathVista-style math and chart format (`Question: … (A) …`), so 0.700 is on an easier subset. The parser now reads all 1,500; the full rerun is pending.
+- **No vLLM media baseline yet.** vLLM 0.32's `/v1/systemone` rejects media for Qwen3.5-9B-Base ("this model does not take image inputs"). Its generic read path renders images only (in current vLLM source, never video), and `--video-pruning-rate` crashes at startup for Qwen3.5 (`no attribute 'video_pruning_method'`). A video/EVS comparison needs vLLM's chat-completions endpoint with letter logprobs instead.
+
 ### Single-pass path for one-question requests (2026-11-14)
 A request with one branch now runs `state + branch` as one left-padded forward (`fork.forward_sequences`), reading the weights once instead of twice (prefill, then the branch). Requests with 2+ branches still fork, and mixed batches split between the two paths. It's on by default (`Backbone.single_pass`); `zero_shot_eval.py --no-single-pass` turns it off. Reads match the fork to < 1e-4 (tiny model; an off-by-one slice fails 4 tests).
 
@@ -314,6 +348,8 @@ M1 design notes:
 - [x] CUDA graphs for the fork branch phase: opt-in `cuda_graphs`, ≤ 7% on 9B/L4 (weight-read bound), not a default
 - [x] Single-pass path for 1-question requests: 1.7–1.8× faster unbatched, 1.08–1.19× at batch 8 (9B/L4)
 - [ ] Latency vs #questions at 512–32k-token states (README §7.8)
+- [x] M5: images and short videos in the state, EVS pruning; POPE 0.91, TempCompass 0.75–0.78, NExT-QA 0.82 (9B zero-shot)
+- [ ] M5 follow-ups: full MMStar rerun, retime video sets with the decode fix, vLLM media baseline via chat completions, image-blind / frame-shuffle stress tests
 - [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
 - [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
 - [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B

@@ -162,6 +162,7 @@ Question: {instructions}\nOptions: {shuffled list of option labels}\nAnswer: {op
 
 ## 7. Milestone M5 — multimodal (after text v1 is solid)
 
+- **Status (2026-11-14):** done for images and short videos with EVS pruning (`system_one/multimodal.py`, README "Images and short videos"). Datasets: POPE, MMStar, TempCompass, NExT-QA (≤ 60 s). Open: full MMStar rerun, vLLM baseline via chat completions, stress tests.
 - Feed images/video through the built-in vision tower into the **state** only. Get state positions from `get_rope_index`. Branch positions continue at the processor's next text position for all 3 M-RoPE axes.
 - Re-run the fork-equivalence test with an image in the state (it catches M-RoPE offset bugs).
 - Add POPE, MMStar, MMBench, and ScienceQA-img to the mix. Hold out MMMU and HallusionBench. Run the README §8.9 stress tests (image-blind, image-swap, frame shuffle, fan-out per frame).
