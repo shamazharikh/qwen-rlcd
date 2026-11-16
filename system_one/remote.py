@@ -119,4 +119,24 @@ class VllmSystemOne(RemoteDecisions):
             if q.type == "choice":
                 criteria = dict(sorted(criteria.items()))
             questions[qid] = {"type": q.type, "instructions": q.instructions, "criteria": criteria}
-        return {"model": self.model, "state": request.state, "questions": questions}
+        body = {"model": self.model, "state": request.state, "questions": questions}
+        if request.images:
+            body["images"] = [_media_url(i, "image") for i in request.images]
+        if request.videos:
+            body["videos"] = [_media_url(v, "video") for v in request.videos]
+        return body
+
+
+def _media_url(src, kind: str) -> str:
+    """URL for vLLM: http(s)/data URLs pass through, local paths become file:// (start vLLM with
+    --allowed-local-media-path), PIL images become PNG data URLs."""
+    if isinstance(src, str):
+        return src if src.startswith(("http://", "https://", "data:", "file://")) else "file://" + os.path.abspath(src)
+    if kind == "image":
+        import base64
+        import io
+
+        buf = io.BytesIO()
+        src.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    raise TypeError(f"can't send {type(src).__name__} as a {kind} URL")

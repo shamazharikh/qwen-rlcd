@@ -88,3 +88,19 @@ def test_chat_scorer_logprobs_and_hard_fallback(monkeypatch):
     assert dict(scorer.usage) == {"prompt_tokens": 120, "completion_tokens": 8, "calls": 3, "hard_answers": 2, "invalid": 1}
     assert render("s", Request.from_dict(REQUEST).questions["team"])[1] == ["A", "B"]
     assert parse("Answer: no", ["yes", "no"]) == "no" and parse("C) maybe", ["A", "B"]) is None
+
+
+def test_vllm_body_sends_media_urls(tmp_path):
+    from PIL import Image
+
+    from system_one.remote import VllmSystemOne
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"")
+    req = Request.from_dict({
+        "state": "Look.", "images": [Image.new("RGB", (4, 4)), "https://example.com/a.png"], "videos": [str(video)],
+        "questions": {"q": {"type": "noul", "instructions": "Is it red?"}},
+    })  # fmt: skip
+    body = VllmSystemOne("m", "http://localhost:1").body(req)
+    assert body["images"][0].startswith("data:image/png;base64,") and body["images"][1] == "https://example.com/a.png"
+    assert body["videos"] == ["file://" + str(video)]

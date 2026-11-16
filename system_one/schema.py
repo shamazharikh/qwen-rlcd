@@ -35,6 +35,14 @@ class Question:
 class Request:
     state: str
     questions: dict[str, Question]
+    # Image / video sources (paths, URLs or data URLs; in-memory PIL images or decoded frames also work),
+    # placed in the state ahead of its text (PLAN.md M5). Same field names as vLLM's /v1/systemone.
+    images: tuple = ()
+    videos: tuple = ()
+
+    @property
+    def has_media(self) -> bool:
+        return bool(self.images or self.videos)
 
     @classmethod
     def from_dict(cls, data: dict) -> Request:
@@ -43,7 +51,14 @@ class Request:
         raw = data.get("questions")
         if not isinstance(raw, dict) or not raw:
             raise ValueError("'questions' must be a non-empty object keyed by question id")
-        return cls(state=data["state"], questions={qid: _parse_question(qid, q) for qid, q in raw.items()})
+        media = {}
+        for key in ("images", "videos"):
+            value = data.get(key) or ()
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"'{key}' must be a list")
+            media[key] = tuple(value)
+        questions = {qid: _parse_question(qid, q) for qid, q in raw.items()}
+        return cls(state=data["state"], questions=questions, **media)
 
 
 def _parse_question(qid: str, q: dict) -> Question:

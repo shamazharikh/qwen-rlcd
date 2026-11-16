@@ -76,10 +76,20 @@ def quantization_config(quantization: str | None):
 def load_text_model(
     model: str = "0.8b", dtype: torch.dtype | None = None, device=None, device_map=None, quantization: str | None = "default"
 ):
-    """Load a Qwen3.5 checkpoint and return `(text_model, lm_head, tokenizer)`.
+    """Load a Qwen3.5 checkpoint and return `(text_model, lm_head, tokenizer)` (see `load_model`)."""
+    full, tokenizer = load_model(model, dtype, device, device_map, quantization)
+    return full.model.language_model, full.lm_head, tokenizer
+
+
+def load_model(
+    model: str = "0.8b", dtype: torch.dtype | None = None, device=None, device_map=None, quantization: str | None = "default",
+    vision: bool = False,
+):  # fmt: skip
+    """Load a Qwen3.5 checkpoint and return `(full_model, tokenizer)`; `full_model.model` is the `Qwen3_5Model`
+    (vision tower + language model), `full_model.lm_head` the LM head.
 
     Weights stream straight to `device` (no full CPU copy, which matters for 9B+ in small pods), and the
-    vision tower stays on CPU since the text path never uses it. Pass `device_map="auto"` to shard a model
+    vision tower stays on CPU unless `vision=True` (images/videos in the state). Pass `device_map="auto"` to shard a model
     that doesn't fit on one GPU. `quantization`: "fp8", None, or "default" (per `DEFAULT_QUANTIZATION`).
     """
     repo = resolve(model)
@@ -92,9 +102,9 @@ def load_text_model(
         quantization = DEFAULT_QUANTIZATION.get(repo) if str(device) != "cpu" else None
     if device_map is None:
         # On-the-fly FP8 refuses CPU entries in a device_map, so then the (bf16, <1 GB) vision tower joins the GPU.
-        visual = str(device) if quantization not in (None, "none") else "cpu"
+        visual = str(device) if vision or quantization not in (None, "none") else "cpu"
         device_map = {"model.language_model": str(device), "lm_head": str(device), "model.visual": visual}
     full = AutoModelForImageTextToText.from_pretrained(
         repo, dtype=dtype, device_map=device_map, quantization_config=quantization_config(quantization)
     ).eval()
-    return full.model.language_model, full.lm_head, AutoTokenizer.from_pretrained(repo)
+    return full, AutoTokenizer.from_pretrained(repo)
