@@ -8,6 +8,10 @@ Probabilities come from the first answer token's `top_logprobs` when the endpoin
 OpenAI-compatible endpoint generally doesn't, so answers are then hard (one-hot): `hard_answers` counts those
 and the eval reports accuracy without calibration. Billed tokens (prompt, completion incl. thinking) are summed
 in `usage` for cost per call.
+
+Requests with media send them as content parts ahead of the text (`image_url` / `video_url`, as vLLM's
+OpenAI server accepts), so the same scorer is the vLLM image/video baseline: `--scorers vllm-chat` points it at
+a local vLLM server, with thinking off (`chat_template_kwargs`) and one answer token.
 """
 
 from __future__ import annotations
@@ -73,32 +77,39 @@ class ChatCompletionScorer:
         max_tokens: int = 16,
         retries: int = 6,
         timeout: float = 60,
+        extra_body: dict | None = None,
+        top_logprobs: int = 10,
     ):
         self.model, self.url = model, base_url.rstrip("/") + "/chat/completions"
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        local = base_url.startswith(("http://localhost", "http://127.", "http://0.0.0.0"))
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ("EMPTY" if local else None)
         if not self.api_key:
             raise RuntimeError("set GEMINI_API_KEY (or OPENAI_API_KEY)")
         self.reasoning_effort, self.logprobs, self.max_tokens = reasoning_effort, logprobs, max_tokens
+        self.extra_body, self.top_logprobs = extra_body or {}, top_logprobs
         self.retries, self.timeout = retries, timeout
         self.usage = Counter()  # prompt_tokens, completion_tokens, calls, hard_answers, invalid, blocked
 
     def predict(self, request: Request | dict) -> dict:
         if isinstance(request, dict):
             request = Request.from_dict(request)
-        return {qid: self._ask(request.state, q) for qid, q in request.questions.items()}
+        media = _media_parts(request)
+        return {qid: self._ask(request.state, q, media) for qid, q in request.questions.items()}
 
-    def _ask(self, state: str, q: Question):
+    def _ask(self, state: str, q: Question, media: list | None = None):
         text, labels = render(state, q)
+        content = [*media, {"type": "text", "text": text}] if media else text
         body = {
             "model": self.model,
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}],
+            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}],
             "temperature": 0,
             "max_tokens": self.max_tokens,
+            **self.extra_body,
         }
         if self.reasoning_effort:
             body["reasoning_effort"] = self.reasoning_effort
         if self.logprobs:
-            body["logprobs"], body["top_logprobs"] = True, 10
+            body["logprobs"], body["top_logprobs"] = True, self.top_logprobs
         data = self._post(body)
         usage = data.get("usage") or {}
         self.usage.update(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), calls=1)
@@ -146,6 +157,13 @@ class ChatCompletionScorer:
                     time.sleep(min(2**attempt, 30))
                     continue
                 raise
+
+
+def _media_parts(request: Request) -> list:
+    from system_one.remote import _media_url
+
+    parts = [{"type": "image_url", "image_url": {"url": _media_url(i, "image")}} for i in request.images]
+    return parts + [{"type": "video_url", "video_url": {"url": _media_url(v, "video")}} for v in request.videos]
 
 
 def _typed(q: Question, probs: list[float]):

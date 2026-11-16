@@ -104,3 +104,27 @@ def test_vllm_body_sends_media_urls(tmp_path):
     body = VllmSystemOne("m", "http://localhost:1").body(req)
     assert body["images"][0].startswith("data:image/png;base64,") and body["images"][1] == "https://example.com/a.png"
     assert body["videos"] == ["file://" + str(video)]
+
+
+def test_chat_scorer_sends_media_and_reads_letter_logprobs(monkeypatch):
+    from PIL import Image
+
+    from system_one.chat import ChatCompletionScorer
+
+    sent = {}
+
+    def fake_post(self, body):
+        sent.update(body)
+        top = [{"token": "B", "logprob": -0.1}, {"token": "A", "logprob": -2.5}]
+        return {"choices": [{"message": {"content": "B"}, "logprobs": {"content": [{"top_logprobs": top}]}}], "usage": {}}
+
+    monkeypatch.setattr(ChatCompletionScorer, "_post", fake_post)
+    scorer = ChatCompletionScorer("m", "http://localhost:8000/v1", max_tokens=1, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    req = Request.from_dict({"state": "Look.", "images": [Image.new("RGB", (4, 4))], "videos": ["/tmp/v.mp4"],
+                             "questions": {"q": {"type": "choice", "instructions": "Colour?", "criteria": {"a": "", "b": ""}}}})  # fmt: skip
+    ans = scorer.predict(req)["q"]
+    parts = sent["messages"][1]["content"]
+    assert [p["type"] for p in parts] == ["image_url", "video_url", "text"]
+    assert parts[1]["video_url"]["url"] == "file:///tmp/v.mp4"
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False} and sent["max_tokens"] == 1
+    assert ans.choice == "b" and ans.probabilities["b"] > 0.9
