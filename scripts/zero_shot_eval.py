@@ -26,6 +26,7 @@ so the fork and vLLM read identical pixels. `--video-pruning-rate` turns on EVS 
 same `--video-pruning-rate` and `--media-io-kwargs '{"video": {"fps": 2, "num_frames": 32}}'`.
 
     python scripts/zero_shot_eval.py --model 9b --scorers letter --datasets pope,mmstar,tempcompass_mc --limit 200
+    python scripts/zero_shot_eval.py --model 9b --scorers vllm-chat --datasets pope,tempcompass_mc   # vLLM baseline
 
     python scripts/zero_shot_eval.py --datasets race,go_emotions --limit 200 --gpu-usd-per-hour 0.9776
 
@@ -56,7 +57,7 @@ from system_one.models import resolve
 from system_one.scorers import Backbone, LetterScorer, LikelihoodScorer
 from system_one.templates import option_keys
 
-REMOTE = {"gemini", "vllm"}  # scorers served over HTTP (plus any "chat:<model>"); no local model needed
+REMOTE = {"gemini", "vllm", "vllm-chat"}  # scorers served over HTTP (plus any "chat:<model>"); no local model needed
 # $ per 1M (input, output) tokens, Google list prices (2026-11): cost per call for API scorers.
 PRICES = {"gemini-decision-1": (0.10, 0.0), "gemini-2.5-flash-lite": (0.10, 0.40), "gemini-3.1-flash-lite": (0.25, 1.50)}
 
@@ -432,6 +433,12 @@ def main():
             workers = args.remote_workers if is_remote(scorer_name) else 1
             if scorer_name.startswith("chat:"):
                 scorer = ChatCompletionScorer(scorer_name[5:], reasoning_effort=args.reasoning_effort)
+            elif scorer_name == "vllm-chat":  # vLLM's OpenAI chat endpoint: letter logprobs, takes images and videos
+                base = (args.vllm_url or os.environ.get("VLLM_BASE_URL", "http://localhost:8000")).rstrip("/") + "/v1"
+                scorer = ChatCompletionScorer(
+                    resolve(args.model), base, max_tokens=1, top_logprobs=20,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                )  # fmt: skip
             else:
                 scorer = scorers[scorer_name]()
             m = evaluate(examples, scorer, workers, args.batch_requests)
@@ -441,7 +448,10 @@ def main():
                 with open(args.dump_preds, "w") as f:
                     json.dump(dumps, f)
             usage = getattr(scorer, "usage", None)
-            if usage:  # chat scorer: billed tokens, hard-answer share, cost per call
+            if usage and scorer_name == "vllm-chat":  # self-hosted: cost from GPU time below
+                m.update({k: int(v) for k, v in usage.items()})
+                m["hard"] = usage["hard_answers"] > usage["calls"] / 2
+            elif usage:  # chat scorer: billed tokens, hard-answer share, cost per call
                 m.update({k: int(v) for k, v in usage.items()})
                 m["hard"] = usage["hard_answers"] > usage["calls"] / 2
                 p_in, p_out = PRICES.get(scorer_name[5:], (float("nan"), float("nan")))
