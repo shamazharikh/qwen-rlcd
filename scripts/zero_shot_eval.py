@@ -364,6 +364,43 @@ def evaluate(examples, scorer, workers=1, batch_requests=1):
     return metrics
 
 
+def _sample(name, args):
+    examples = list(DATASETS[name](CALIBRATION_SPLITS[name]) if args.split == "calibration" else DATASETS[name]())
+    examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
+    return [prepare_media(e) for e in examples] if name in MEDIA else examples
+
+
+def load_examples(name, args):
+    """The sampled (request, labels) list for `name`. With --examples-dir it is cached there once, videos copied
+    beside it, so another machine evaluates exactly the same requests without the datasets or video zips."""
+    if not args.examples_dir:
+        return _sample(name, args)
+    import pickle
+    import shutil
+
+    root = os.path.abspath(args.examples_dir)
+    path = os.path.join(root, f"{name}_{args.split}_seed{args.seed}_n{args.limit}.pkl")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            examples = pickle.load(f)
+        return [({**r, "videos": [os.path.join(root, v) for v in r["videos"]]} if r.get("videos") else r, l) for r, l in examples]
+    examples = _sample(name, args)
+    stored = []
+    for r, l in examples:
+        if r.get("videos"):
+            os.makedirs(os.path.join(root, "videos"), exist_ok=True)
+            rel = [os.path.join("videos", os.path.basename(v)) for v in r["videos"]]
+            for v, dst in zip(r["videos"], rel):
+                if not os.path.exists(os.path.join(root, dst)):
+                    shutil.copy(v, os.path.join(root, dst))
+            r = {**r, "videos": rel}
+        stored.append((r, l))
+    os.makedirs(root, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(stored, f)
+    return examples
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="0.8b", help="alias (0.8b, 9b, 35b-a3b) or HF repo id")
@@ -384,6 +421,8 @@ def main():
     parser.add_argument("--batch-requests", type=int, default=1, help="local scorers: requests prefilled and branched together")
     parser.add_argument("--no-single-pass", action="store_true", help="local scorers: fork even for one-question requests")
     parser.add_argument("--cuda-graphs", action="store_true", help="local scorers: replay branch forwards as CUDA graphs")
+    parser.add_argument("--examples-dir", help="cache the sampled requests (and their videos) here, or load them if present")
+    parser.add_argument("--gemini-media-resolution", default=None, choices=["low", "medium", "high"], help="gemini: media resolution (default: API default)")
     parser.add_argument("--video-pruning-rate", type=float, default=0.0, help="local scorers: EVS q in [0, 1) for video tokens")
     parser.add_argument("--video-fps", type=float, default=2.0, help="video frames sampled per second (max --video-max-frames)")
     parser.add_argument("--video-max-frames", type=int, default=32)
@@ -408,7 +447,7 @@ def main():
         backbone.media.fps, backbone.media.max_frames = args.video_fps, args.video_max_frames
         backbone.media.image_max_pixels, backbone.media.video_max_side = IMAGE_MAX_PIXELS, VIDEO_MAX_SIDE
     scorers = {
-        "gemini": lambda: GeminiDecisions(),  # hosted reference model; needs GEMINI_API_KEY
+        "gemini": lambda: GeminiDecisions(resolution=args.gemini_media_resolution),  # hosted reference; needs GEMINI_API_KEY
         "vllm": lambda: VllmSystemOne(resolve(args.model), args.vllm_url),  # vLLM /v1/systemone serving --model
         "letter": lambda: LetterScorer(backbone),
         "sum": lambda: LikelihoodScorer(backbone, "sum"),
@@ -422,10 +461,7 @@ def main():
     print("| dataset | scorer | requests | questions | acc | NLL | Brier | ECE-15 | MAE / F1 | s/request | ms/question | $ per 1M requests |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for name in args.datasets.split(","):
-        examples = list(DATASETS[name](CALIBRATION_SPLITS[name]) if args.split == "calibration" else DATASETS[name]())
-        examples = random.Random(args.seed).sample(examples, min(args.limit, len(examples)))
-        if name in MEDIA:
-            examples = [prepare_media(e) for e in examples]
+        examples = load_examples(name, args)
         for scorer_name in args.scorers.split(","):
             if args.warmup and not is_remote(scorer_name):  # untimed: Triton/fla compile and autotune per new shape
                 evaluate(examples[: args.warmup], scorers[scorer_name](), 1, args.batch_requests)

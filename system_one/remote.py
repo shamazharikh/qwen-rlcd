@@ -46,7 +46,7 @@ class RemoteDecisions:
 
     url: str
 
-    def __init__(self, model: str, headers: dict | None = None, retries: int = 5, timeout: float = 60):
+    def __init__(self, model: str, headers: dict | None = None, retries: int = 5, timeout: float = 180):
         self.model, self.headers, self.retries, self.timeout = model, headers or {}, retries, timeout
         self.usage_tokens = 0
 
@@ -87,7 +87,9 @@ class GeminiDecisions(RemoteDecisions):
 
     url = "https://generativelanguage.googleapis.com/v1beta/decisions"
 
-    def __init__(self, model: str = "gemini-decision-1", api_key: str | None = None, **kwargs):
+    def __init__(self, model: str = "gemini-decision-1", api_key: str | None = None, resolution: str | None = None, **kwargs):
+        """`resolution`: media resolution for images/videos ("low", "medium", "high"); None keeps the API default."""
+        self.resolution = resolution
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("set GEMINI_API_KEY")
@@ -99,7 +101,40 @@ class GeminiDecisions(RemoteDecisions):
             questions[qid] = {"type": q.type, "instructions": q.instructions}
             if q.type != "noul":
                 questions[qid]["criteria"] = _criteria(q)
-        return {"model": self.model, "input": request.state, "questions": questions}
+        body = {"model": self.model, "input": request.state, "questions": questions}
+        if request.has_media:  # input becomes content blocks: the state text, then each image / video inline
+            blocks = [{"type": "text", "text": request.state}]
+            blocks += [{"type": "image", **inline_media(i, "image")} for i in request.images]
+            blocks += [{"type": "video", **inline_media(v, "video")} for v in request.videos]
+            if self.resolution:
+                for b in blocks[1:]:
+                    b["resolution"] = self.resolution
+            body["input"] = blocks
+        return body
+
+
+MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+        ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/mov", ".avi": "video/avi"}  # fmt: skip
+
+
+def inline_media(src, kind: str) -> dict:
+    """{"data": base64, "mime_type": ...} for a PIL image, a local path or a data URL."""
+    import base64
+    import io
+
+    if isinstance(src, str) and src.startswith("data:"):
+        head, data = src.split(",", 1)
+        return {"data": data, "mime_type": head[5:].split(";")[0]}
+    if isinstance(src, str):
+        path = src[7:] if src.startswith("file://") else src
+        with open(path, "rb") as f:
+            raw = f.read()
+        return {"data": base64.b64encode(raw).decode(), "mime_type": MIME[os.path.splitext(path)[1].lower()]}
+    if kind == "image":
+        buf = io.BytesIO()
+        src.save(buf, format="PNG")
+        return {"data": base64.b64encode(buf.getvalue()).decode(), "mime_type": "image/png"}
+    raise TypeError(f"can't inline {type(src).__name__} as a {kind}")
 
 
 class VllmSystemOne(RemoteDecisions):
