@@ -11,7 +11,7 @@ choice/score questions, and a scalar logit of P(yes) for noul questions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
@@ -28,6 +28,8 @@ class Backbone:
     lm_head: nn.Module
     tokenizer: object
     chunk_size: int | None = 32
+    cuda_graphs: bool = False  # replay branch forwards through captured CUDA graphs (system_one/graphs.py)
+    _runner: object = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_pretrained(cls, repo: str = "0.8b", dtype=None, device=None, device_map=None, quantization="default", **kwargs):
@@ -45,6 +47,17 @@ class Backbone:
     def device(self) -> torch.device:
         return self.text_model.embed_tokens.weight.device
 
+    @property
+    def runner(self):
+        """Lazily built `GraphBranchRunner`; its largest row bucket is `chunk_size`."""
+        chunk = self.chunk_size or 32
+        if self._runner is None or self._runner.row_buckets[-1] != chunk:
+            from system_one.graphs import GraphBranchRunner
+
+            buckets = tuple(sorted({b for b in (1, 2, 4, 8, 16, 32, 64, 128) if b < chunk} | {chunk}))
+            self._runner = GraphBranchRunner(self.text_model, self.pad_id, row_buckets=buckets)
+        return self._runner
+
     def encode(self, text: str) -> list[int]:
         return self.tokenizer(text, add_special_tokens=False).input_ids
 
@@ -52,6 +65,9 @@ class Backbone:
         """Prefill `state_text` once and return each branch's hidden states, a list of [len_i, d]."""
         state_ids = torch.tensor([self.encode(state_text)], device=self.device)
         cache = prefill_state(self.text_model, state_ids)
+        if self.cuda_graphs:
+            mask = torch.ones_like(state_ids)
+            return self.runner(cache, mask, branches, [0] * len(branches))
         return forward_branches_all(self.text_model, cache, state_ids.shape[1], branches, self.pad_id, self.chunk_size)
 
     def run_batch(self, state_texts: list[str], branches: list[list[list[int]]]) -> list[list[torch.Tensor]]:
@@ -62,7 +78,10 @@ class Backbone:
         cache, mask = prefill_states(self.text_model, [self.encode(t) for t in state_texts], self.pad_id)
         flat = [b for bs in branches for b in bs]
         rows = [r for r, bs in enumerate(branches) for _ in bs]
-        hidden = forward_branches_batched(self.text_model, cache, mask, flat, rows, self.pad_id, self.chunk_size)
+        if self.cuda_graphs:
+            hidden = self.runner(cache, mask, flat, rows)
+        else:
+            hidden = forward_branches_batched(self.text_model, cache, mask, flat, rows, self.pad_id, self.chunk_size)
         out, i = [], 0
         for bs in branches:
             out.append(hidden[i : i + len(bs)])

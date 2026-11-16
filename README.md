@@ -249,6 +249,24 @@ ms/question is wall time per request ÷ questions per request. Self-hosted $ = L
 - **Chunks must stay at 16–32 rows for 9B on 24 GB.** Each branch row holds its own copy of the DeltaNet recurrent state (tens of MB at 9B), so 64-row chunks ran out of memory next to 18 GB of weights.
 - **Time with a warmup.** Batching creates many new shapes, and the first run of each pays Triton/fla compile and autotune. Without `--warmup`, the first configuration measured looked slower than batch 1.
 
+### CUDA graphs for the fork's branch phase (2026-11-14)
+`system_one/graphs.py` (`GraphBranchRunner`, `Backbone.cuda_graphs`, `zero_shot_eval.py --cuda-graphs`, `bench_fork.py --graphs`) captures one CUDA graph per (rows, branch length, state length) bucket. Attention KV sits in preallocated `[pad | state | branch]` buffers that a static cache layer writes in place, DeltaNet states are copied into fixed buffers, and masks are precomputed. Passing them as a dict skips transformers' mask builders, which sync with the host. Outputs match `forward_branches_batched` to < 1e-5 (tiny dense and MoE models, CPU and L4). MoE models can't be captured, because transformers' routing syncs with the host, so they fall back to the same static path run eagerly.
+
+**It doesn't pay off for 9B on an L4, so it stays opt-in.** Branch phase only (state already prefilled, exact-fit buckets, median of 10):
+
+| state | rows × branch tokens | prefill ms | eager branches ms | graph branches ms | speedup |
+|---|---|---|---|---|---|
+| 512 | 1 × 8 | 208 | 71.2 | 66.3 | 1.07× |
+| 512 | 4 × 24 | 208 | 88.5 | 85.0 | 1.04× |
+| 512 | 16 × 24 | 208 | 213.7 | 213.0 | 1.00× |
+| 2048 | 1 × 8 | 741 | 72.7 | 68.6 | 1.06× |
+| 2048 | 4 × 24 | 741 | 101.0 | 96.4 | 1.05× |
+| 2048 | 16 × 24 | 741 | 259.7 | 261.7 | 0.99× |
+
+- **The branch phase is bound by weight reads, not launches.** One 8-token branch takes 66 ms with graphs, about the time to stream 18 GB of bf16 weights at the L4's ~300 GB/s. Graphs remove ~4 ms of launch overhead, under 2% of a request once prefill is counted. With bucket padding (e.g. 10 → 16 rows, 24 → 32 tokens), `bench_fork --graphs` end to end was 0.74–1.02× eager, and the shared graph pool OOMed at 2048 × 32 rows next to the weights.
+- **Prefill is GEMM-bound.** In a 512-token prefill, GEMMs take 80% of CUDA time (152 of 189 ms, ~61 TFLOPs, about half the L4's bf16 peak), the fla DeltaNet kernel 3%, and the reference-PyTorch `causal_conv1d` 4%. Fused kernels have little left to win here.
+- **Why vLLM is ~2× faster per single-question request:** the fork pays two weight passes, prefill plus a ~70 ms branch pass, where vLLM runs the state and question in one. For one branch, a single `state + branch` forward is already faster than forking (512: 212 vs 258 ms; 2048: 740 vs 778 ms in `bench_fork`). Request batching amortizes the branch pass (0.068 s per ARC request at 8 × 32, below vLLM's 0.1 s one at a time). For 1-question requests, the cheaper fix is to skip the fork and run one concatenated forward.
+
 ### Calibration and the zero-shot yes-bias (M3, 2026-11-14)
 `--split calibration` runs each dataset on a held-out split (train or validation), and `--dump-preds` saves per-question probabilities. `scripts/calibrate_eval.py` fits `system_one/calibrate.py` and reports test metrics before and after: a temperature per (type, K-bucket) for choice/score, Platt scaling (scale + bias on the logit) for yes/no, and for yes/no datasets also F1 at the threshold that maximises F1 on the calibration split. 9B, 200 calibration and 500 test requests per dataset:
 
@@ -277,7 +295,8 @@ M1 design notes:
 - [x] Qwen3.5-9B and 35B-A3B (FP8) backbones, and vLLM `/v1/systemone` comparison (n = 500)
 - [x] Multi-question benchmark (RACE, GoEmotions): fork vs vLLM `/v1/systemone` vs Gemini Decision 1 vs chat baselines
 - [x] Batch requests in the fork (1.7–2.5× cheaper single-question requests)
-- [ ] CUDA graphs / fused kernels for the fork; latency vs #questions at 512–32k-token states (README §7.8)
+- [x] CUDA graphs for the fork branch phase: opt-in `cuda_graphs`, ≤ 7% on 9B/L4 (weight-read bound), not a default
+- [ ] Single-pass path for 1-question requests (state + branch in one forward, no second weight pass); latency vs #questions at 512–32k-token states (README §7.8)
 - [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
 - [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
 - [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B
