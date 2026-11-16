@@ -17,7 +17,7 @@ The implementation targets **`Qwen/Qwen3.5-0.8B-Base`**. See [`PLAN.md`](PLAN.md
 | **M2** training (LoRA + heads) | ⏸ On hold |
 | **M3** calibration and eval | Metrics (`metrics.py`: acc, NLL, Brier, ECE-15, MAE) in place; temperature fitting and stress suite not started |
 | **M4** serving | Not started |
-| **M5** multimodal | 🟡 Images and short videos in the state, with EVS video-token pruning; fork numbers on POPE, TempCompass, NExT-QA (see "Images and short videos"). Remaining: full MMStar run, a vLLM media baseline. |
+| **M5** multimodal | 🟡 Images and short videos in the state, with EVS video-token pruning; fork vs vLLM on POPE, MMStar, TempCompass, NExT-QA (see "Images and short videos"). Remaining: chat-format prompt in the fork, stress tests, vLLM EVS once it works for Qwen3.5. |
 
 **Environment:** the dev box is 2× RTX 2080 Ti (11 GB, sm75). GPU 0 fell off the PCIe bus during a dual-GPU benchmark on 2026-09-24, and CUDA init fails on both cards until a reboot or root reset. Run one GPU job at a time on this box. GPU runs since 2026-11-13 use an NVIDIA L4 (24 GB, sm89) in a Kubernetes dev pod: `pip install uv && uv venv .venv && uv pip install -e '.[dev,eval,cuda]'`.
 
@@ -258,30 +258,31 @@ ms/question is wall time per request ÷ questions per request. Self-hosted $ = L
 - **EVS** (`--video-pruning-rate q`, vLLM's Efficient Video Sampling): rank video tokens by 1 − cosine similarity to the same patch in the previous temporal group, always keep the first group, keep `max(tokens per group, int(total × (1 − q)))`. Kept tokens keep their unpruned positions, as in vLLM.
 - **Same inputs for every scorer:** video frames are sampled with vLLM's rule (`min(32, floor(duration × 2 fps))` frames at `linspace(0, total − 1, n)`, timestamps from source indices). Sampled videos are transcoded to ≤ 448 px and images capped at 1 MP before any scorer sees them.
 
-9B `letter` on an L40S, 200 requests per dataset (seed 0), one request per image or clip carrying all its questions, $ per 1M requests at $1.861/h:
+Qwen3.5-9B-Base zero-shot on an L40S, 200 requests per dataset (seed 0), one request per image or clip carrying all its questions. The fork is the `letter` scorer, one request at a time. vLLM is nightly 0.34.0rc1 through its OpenAI chat endpoint (`--scorers vllm-chat`: media parts, thinking off, letter logprobs from the first answer token), because its `/v1/systemone` endpoint rejects media for Qwen3.5-Base. Seconds per request (vLLM at 1 / 8 concurrent requests):
 
-| dataset | questions | acc | F1 | ECE-15 | s/request | ms/question | $ per 1M requests |
-|---|---|---|---|---|---|---|---|
-| POPE (COCO, ~18 yes/no per image) | 3,600 | 0.908 | 0.906 | 0.025 | 0.21 | 12 | $111 |
-| TempCompass MC + caption matching (10–30 s clips) | 1,515 | 0.777 | – | 0.042 | 0.56 | 74 | $291 |
-| TempCompass yes/no | 1,251 | 0.746 | 0.777 | 0.037 | 0.53 | 84 | $272 |
-| NExT-QA MC (clips ≤ 60 s) | 1,630 | 0.823 | – | 0.021 | 1.15 | 142 | $597 |
-| MMStar (partial, see below) | 200 | 0.700 | – | 0.126 | 0.09 | 93 | $48 |
+| dataset | questions | fork acc | vLLM acc | fork s/request | vLLM s/request (1 / 8) |
+|---|---|---|---|---|---|
+| POPE (COCO, ~18 yes/no per image) | 3,600 | **0.908** (F1 0.906) | 0.893 (F1 0.884) | **0.21** | 1.18 / 0.55 |
+| MMStar (one question per image) | 200 | **0.735** | 0.725 / 0.735 | 0.10 | 0.12 / **0.04** |
+| TempCompass MC + caption matching (10–30 s clips) | 1,515 | 0.777 | **0.816** | **0.44** | 1.71 / 0.91 |
+| TempCompass yes/no | 1,251 | 0.746 (F1 0.777) | **0.804** (F1 0.800) | **0.41** | 1.40 / 0.75 |
+| NExT-QA MC (clips ≤ 60 s) | 1,630 | 0.823 | **0.839** | **0.75** | 3.99 / 2.30 |
 
-EVS in the fork (accuracy, s/request):
+EVS in the fork (accuracy · s/request; q = 0.75 was timed before the decode fix):
 
-| dataset | q = 0 | q = 0.5 | q = 0.75 |
+| dataset | no pruning | q = 0.5 | q = 0.75 |
 |---|---|---|---|
-| TempCompass MC | 0.777, 0.56 | 0.772, 0.49 | 0.737, 0.47 |
-| TempCompass yes/no | 0.746, 0.53 | 0.761, 0.48 | 0.727, 0.47 |
-| NExT-QA | 0.823, 1.15 | 0.807, 1.05 | 0.801, 0.98 |
+| TempCompass MC | 0.777 · 0.44 | 0.772 · 0.37 | 0.737 · (0.47) |
+| TempCompass yes/no | 0.746 · 0.41 | 0.761 · 0.35 | 0.727 · (0.47) |
+| NExT-QA | 0.823 · 0.75 | 0.807 · 0.73 | 0.801 · (0.98) |
 
-- **9B zero-shot sees well.** POPE 0.91 accuracy and F1, with ECE 0.025, so no yes-bias on images, unlike GoEmotions. Probabilities on the video sets are well calibrated too (ECE 0.02–0.04).
-- **EVS at q = 0.5 costs ≤ 0.016 accuracy** (TempCompass yes/no even gains 0.015, inside noise). At q = 0.75 the loss grows to 0.02–0.04.
-- **EVS saves little time here (9–16%) because video decoding dominated, not the model.** The loader decoded and converted every frame to RGB on the CPU and the GPU sat idle much of the time. Converting only the sampled frames (threaded decode) is now 5.7× faster on a 20 s clip with identical frames; these timings predate that fix.
-- **Fan-out pays off on images:** POPE's ~18 questions per image cost 12 ms each after one image prefill.
-- **MMStar is partial:** this run's parser skipped 346 of 1,500 questions, mostly the MathVista-style math and chart format (`Question: … (A) …`), so 0.700 is on an easier subset. The parser now reads all 1,500; the full rerun is pending.
-- **No vLLM media baseline yet.** vLLM 0.32's `/v1/systemone` rejects media for Qwen3.5-9B-Base ("this model does not take image inputs"). Its generic read path renders images only (in current vLLM source, never video), and `--video-pruning-rate` crashes at startup for Qwen3.5 (`no attribute 'video_pruning_method'`). A video/EVS comparison needs vLLM's chat-completions endpoint with letter logprobs instead.
+- **Many questions per image or clip is where the fork wins:** 1.8–3.1× faster than vLLM at 8 concurrent requests and 3–6× one at a time, because vLLM's chat endpoint runs one call per question. With one question per image (MMStar), concurrent vLLM is faster.
+- **vLLM is 0.02–0.06 more accurate on video**, and the fork is 0.015 more accurate on POPE. The prompts differ: vLLM uses the chat template with a classifier system prompt, while the fork reads a plain continuation. A chat-format prompt in the fork is the obvious next test.
+- **No yes-bias on images:** POPE accuracy and F1 are both ~0.91 with ECE 0.025, unlike the text yes/no sets. Video probabilities are well calibrated too (ECE 0.02–0.04).
+- **EVS at q = 0.5 is nearly free on accuracy** (−0.016 to +0.015) and saves 15–16% per TempCompass request. On NExT-QA's longer clips (up to 1,800 frames), decoding still dominates, so pruning saves little there. Our EVS keeps exactly the tokens vLLM's implementation keeps (identical masks on 45 cases checked against vLLM 0.32).
+- **Video decoding was the first bottleneck:** converting only the sampled frames to RGB made video requests 21–35% faster with identical frames and accuracy.
+- **No vLLM EVS comparison is possible yet:** `--video-pruning-rate` crashes at startup for Qwen3.5 in both vLLM 0.32 and nightly 0.34.0rc1 (`'Qwen3_5ForConditionalGeneration' object has no attribute 'video_pruning_method'`).
+- **MMStar now parses all 1,500 questions** (both option formats). The first run skipped the 23% in MathVista style and scored 0.700 on the rest.
 
 ### Single-pass path for one-question requests (2026-11-14)
 A request with one branch now runs `state + branch` as one left-padded forward (`fork.forward_sequences`), reading the weights once instead of twice (prefill, then the branch). Requests with 2+ branches still fork, and mixed batches split between the two paths. It's on by default (`Backbone.single_pass`); `zero_shot_eval.py --no-single-pass` turns it off. Reads match the fork to < 1e-4 (tiny model; an off-by-one slice fails 4 tests).
@@ -349,7 +350,8 @@ M1 design notes:
 - [x] Single-pass path for 1-question requests: 1.7–1.8× faster unbatched, 1.08–1.19× at batch 8 (9B/L4)
 - [ ] Latency vs #questions at 512–32k-token states (README §7.8)
 - [x] M5: images and short videos in the state, EVS pruning; POPE 0.91, TempCompass 0.75–0.78, NExT-QA 0.82 (9B zero-shot)
-- [ ] M5 follow-ups: full MMStar rerun, retime video sets with the decode fix, vLLM media baseline via chat completions, image-blind / frame-shuffle stress tests
+- [x] M5 follow-ups: full MMStar, video sets retimed with the decode fix, vLLM media baseline via chat completions
+- [ ] M5: chat-format prompt in the fork (vLLM leads on video by 0.02–0.06), image-blind / frame-shuffle stress tests, vLLM EVS once it supports Qwen3.5
 - [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
 - [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
 - [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B
