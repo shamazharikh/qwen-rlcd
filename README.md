@@ -170,7 +170,7 @@ Other local scorers that beat `letter`: SST-5 sum-pmi 0.306 (0.8B) / 0.484 (9B),
 
 - **9B gets within 0.01–0.06 of Gemini zero-shot** and is mostly well calibrated (ECE 0.03–0.06, except SST-5). It's the practical pick: 35B-A3B (FP8) beats it only on ARC-Challenge (+0.02, inside the ±0.04 CI), trails on AG News (−0.05) and SST-5 letter, and runs 2–3× slower here (eager FP8 MoE in transformers, no fused kernels; 40 layers vs 32).
 - **vLLM `/v1/systemone` is the same idea as `letter`** (one read of a single label token, softmax over labels) with a different prompt: chat template with thinking off, options as `A: name - description`. At 9B the two are tied on every dataset (±0.02), with vLLM slightly better calibrated. At 0.8B ours wins on knowledge MC by 0.08–0.15 and vLLM wins on AG News by 0.08: the small model is prompt-sensitive, the 9B isn't.
-- **vLLM is ~2× faster per single-question request** (9B: 0.1 s vs 0.18 s, both bf16): CUDA graphs and fused kernels vs our eager path. These runs have one question per state, so they don't exercise the fork's advantage (one state prefill shared by many questions), nor vLLM's limits (64 questions, 26 options, 10 levels, one read per question). A many-questions-per-state benchmark is the next comparison.
+- **vLLM is ~2× faster per single-question request** (9B: 0.1 s vs 0.18 s, both bf16): at the time attributed to CUDA graphs and fused kernels; it was really the fork's second weight pass, which the single-pass path removes (0.089–0.100 s, see below). These runs have one question per state, so they don't exercise the fork's advantage (one state prefill shared by many questions), nor vLLM's limits (64 questions, 26 options, 10 levels, one read per question). A many-questions-per-state benchmark is the next comparison.
 - Benchmarks (`bench_fork.py --chunk-size 10`, 24-token branches): 9B bf16 on L4, 2048 × 50 branches in 1.47 s at 16.4 GiB, 8.7× faster than sequential at 10 branches. 35B-A3B FP8 on L40S, 2048 × 50 in 1.02 s at 33.7 GiB, 5.1× at 10 branches.
 
 **FP8 and MoE make reads depend on batch shape.** On real 35B-A3B weights (FP8), fork vs sequential reads differ by 1 − cos = 6.1e-3, against ~1e-4 for the dense models in bf16. A diagnostic (router top-8 at each read token, L40S) shows the fork is not the cause:
@@ -249,6 +249,22 @@ ms/question is wall time per request ÷ questions per request. Self-hosted $ = L
 - **Chunks must stay at 16–32 rows for 9B on 24 GB.** Each branch row holds its own copy of the DeltaNet recurrent state (tens of MB at 9B), so 64-row chunks ran out of memory next to 18 GB of weights.
 - **Time with a warmup.** Batching creates many new shapes, and the first run of each pays Triton/fla compile and autotune. Without `--warmup`, the first configuration measured looked slower than batch 1.
 
+### Single-pass path for one-question requests (2026-11-14)
+A request with one branch now runs `state + branch` as one left-padded forward (`fork.forward_sequences`), reading the weights once instead of twice (prefill, then the branch). Requests with 2+ branches still fork, and mixed batches split between the two paths. It's on by default (`Backbone.single_pass`); `zero_shot_eval.py --no-single-pass` turns it off. Reads match the fork to < 1e-4 (tiny model; an off-by-one slice fails 4 tests).
+
+9B `letter` on an L4, the same 200 requests per dataset, chunk 32, s per request ($ per 1M at $0.9776/h):
+
+| batch | path | ARC-Challenge acc | ARC s/request | BoolQ acc | BoolQ s/request |
+|---|---|---|---|---|---|
+| 1 | fork | 0.935 | 0.162 ($44) | 0.900 | 0.172 ($47) |
+| 1 | single pass | 0.940 | **0.089 ($24)** | 0.905 | **0.100 ($27)** |
+| 8 | fork | 0.935 | 0.064 ($18) | 0.910 | 0.100 ($27) |
+| 8 | single pass | 0.940 | **0.054 ($15)** | 0.905 | **0.093 ($25)** |
+
+- **1.7–1.8× faster one request at a time**, level with vLLM's 0.09–0.11 s on the same GPU. That gap was the fork's second weight pass, not kernels or launch overhead (see the CUDA-graph section).
+- **1.08–1.19× with batch 8**, where batching was already spreading the branch pass across requests. ARC-Challenge goes to $15 per 1M requests.
+- Accuracy is unchanged (±0.005; only bf16 rounding differs between the paths).
+
 ### CUDA graphs for the fork's branch phase (2026-11-14)
 `system_one/graphs.py` (`GraphBranchRunner`, `Backbone.cuda_graphs`, `zero_shot_eval.py --cuda-graphs`, `bench_fork.py --graphs`) captures one CUDA graph per (rows, branch length, state length) bucket. Attention KV sits in preallocated `[pad | state | branch]` buffers that a static cache layer writes in place, DeltaNet states are copied into fixed buffers, and masks are precomputed. Passing them as a dict skips transformers' mask builders, which sync with the host. Outputs match `forward_branches_batched` to < 1e-5 (tiny dense and MoE models, CPU and L4). MoE models can't be captured, because transformers' routing syncs with the host, so they fall back to the same static path run eagerly.
 
@@ -296,7 +312,8 @@ M1 design notes:
 - [x] Multi-question benchmark (RACE, GoEmotions): fork vs vLLM `/v1/systemone` vs Gemini Decision 1 vs chat baselines
 - [x] Batch requests in the fork (1.7–2.5× cheaper single-question requests)
 - [x] CUDA graphs for the fork branch phase: opt-in `cuda_graphs`, ≤ 7% on 9B/L4 (weight-read bound), not a default
-- [ ] Single-pass path for 1-question requests (state + branch in one forward, no second weight pass); latency vs #questions at 512–32k-token states (README §7.8)
+- [x] Single-pass path for 1-question requests: 1.7–1.8× faster unbatched, 1.08–1.19× at batch 8 (9B/L4)
+- [ ] Latency vs #questions at 512–32k-token states (README §7.8)
 - [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
 - [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
 - [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B

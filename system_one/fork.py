@@ -69,23 +69,38 @@ def select_cache_rows(cache: DynamicCache, rows: torch.LongTensor, batch_size: i
     return new
 
 
+def _left_pad(seqs: list[list[int]], pad_id: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """[B, S_max] left-padded ids, padding mask (1 = real token) and positions (real tokens at 0..len-1)."""
+    if any(len(s) == 0 for s in seqs):
+        raise ValueError("sequences must be non-empty")
+    b, s_max = len(seqs), max(len(s) for s in seqs)
+    input_ids = torch.full((b, s_max), pad_id, dtype=torch.long, device=device)
+    mask = torch.zeros((b, s_max), dtype=torch.long, device=device)
+    for i, s in enumerate(seqs):
+        input_ids[i, s_max - len(s) :] = torch.tensor(s, dtype=torch.long, device=device)
+        mask[i, s_max - len(s) :] = 1
+    return input_ids, mask, (mask.cumsum(-1) - 1).clamp_min(0)
+
+
 def prefill_states(text_model, states: list[list[int]], pad_id: int) -> tuple[DynamicCache, torch.Tensor]:
     """Prefill several states in one batch, left-padded to the longest. Returns the cache and the [B, S_max]
     padding mask (1 = real token). Real tokens get positions 0..len-1, as in an unpadded prefill; DeltaNet
     layers zero the padded positions, so their recurrent and conv states start exactly as for an unpadded row."""
-    if any(len(s) == 0 for s in states):
-        raise ValueError("states must be non-empty")
-    device = text_model.embed_tokens.weight.device
-    b, s_max = len(states), max(len(s) for s in states)
-    input_ids = torch.full((b, s_max), pad_id, dtype=torch.long, device=device)
-    mask = torch.zeros((b, s_max), dtype=torch.long, device=device)
-    for i, s in enumerate(states):
-        input_ids[i, s_max - len(s) :] = torch.tensor(s, dtype=torch.long, device=device)
-        mask[i, s_max - len(s) :] = 1
-    position_ids = (mask.cumsum(-1) - 1).clamp_min(0)
+    input_ids, mask, position_ids = _left_pad(states, pad_id, text_model.embed_tokens.weight.device)
     cache = DynamicCache(config=text_model.config)
     text_model(input_ids=input_ids, attention_mask=mask, position_ids=position_ids, past_key_values=cache, use_cache=True)
     return cache, mask
+
+
+def forward_sequences(text_model, seqs: list[list[int]], pad_id: int) -> list[torch.Tensor]:
+    """One uncached, left-padded forward over full sequences. Returns each sequence's final-norm hidden states
+    over its real tokens, a list of [len_i, d].
+
+    For a request with a single branch, running `state + branch` this way reads the weights once, where the
+    fork reads them twice (state prefill, then the branch forward). On 9B that second pass costs ~70 ms."""
+    input_ids, mask, position_ids = _left_pad(seqs, pad_id, text_model.embed_tokens.weight.device)
+    out = text_model(input_ids=input_ids, attention_mask=mask, position_ids=position_ids, use_cache=False)
+    return [out.last_hidden_state[i, input_ids.shape[1] - len(s) :] for i, s in enumerate(seqs)]
 
 
 def forward_branches_batched(

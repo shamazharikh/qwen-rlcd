@@ -235,3 +235,22 @@ def test_predict_batch_matches_predict(backbone, scorer_cls):
                 pa = a.probabilities.values() if isinstance(a.probabilities, dict) else a.probabilities
                 pb = b.probabilities.values() if isinstance(b.probabilities, dict) else b.probabilities
                 assert max(abs(x - y) for x, y in zip(pa, pb)) < 1e-4, qid
+
+
+def test_single_pass_matches_fork(backbone):
+    """`state + branch` in one forward (one-branch requests) reads the same hidden states as the fork, including
+    left-padded batches larger than `chunk_size` mixed with multi-branch requests."""
+    random_states = ["Short.", "A much longer state " * 9, "Mid-length state here.", "x", "y " * 30, "Five."]
+    branches = [[backbone.encode(" Is it fine?")]] * 5 + [[backbone.encode(" Yes"), backbone.encode(" Nope, no")]]
+    try:
+        with torch.no_grad():
+            backbone.single_pass = True
+            single = backbone.run_batch(random_states, branches)
+            backbone.single_pass = False
+            forked = backbone.run_batch(random_states, branches)
+    finally:
+        backbone.single_pass = True
+    for a_req, b_req in zip(single, forked):
+        for a, b in zip(a_req, b_req):
+            assert a.shape == b.shape
+            assert (a - b).abs().max().item() < 1e-4
