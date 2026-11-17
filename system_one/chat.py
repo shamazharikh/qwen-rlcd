@@ -96,7 +96,7 @@ class ChatCompletionScorer:
         if isinstance(request, dict):
             request = Request.from_dict(request)
         if request.has_media and "generativelanguage.googleapis.com" in self.url:
-            parts = _gemini_parts(request)
+            parts = _gemini_parts(request, self.api_key)
             return {qid: self._ask_gemini_native(request.state, q, parts) for qid, q in request.questions.items()}
         media = _media_parts(request)
         return {qid: self._ask(request.state, q, media) for qid, q in request.questions.items()}
@@ -196,11 +196,20 @@ def _media_parts(request: Request) -> list:
     return parts + [{"type": "video_url", "video_url": {"url": _media_url(v, "video")}} for v in request.videos]
 
 
-def _gemini_parts(request: Request) -> list:
-    from system_one.remote import inline_media
+def _gemini_parts(request: Request, api_key: str) -> list:
+    """Images inline; local videos uploaded once to the Files API and referenced by URI in every call."""
+    from system_one.gemini_files import upload
+    from system_one.remote import MIME, inline_media
 
-    media = [inline_media(i, "image") for i in request.images] + [inline_media(v, "video") for v in request.videos]
-    return [{"inline_data": m} for m in media]
+    parts = [{"inline_data": inline_media(i, "image")} for i in request.images]
+    for v in request.videos:
+        if isinstance(v, str) and not v.startswith(("data:", "http://", "https://")):
+            path = v[7:] if v.startswith("file://") else v
+            mime = MIME[os.path.splitext(path)[1].lower()]
+            parts.append({"file_data": {"file_uri": upload(path, mime, api_key), "mime_type": mime}})
+        else:
+            parts.append({"inline_data": inline_media(v, "video")})
+    return parts
 
 
 def _typed(q: Question, probs: list[float]):
