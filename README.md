@@ -313,6 +313,23 @@ $ per 1M requests (self-hosted: L40S $1.861/h × wall time; vLLM at 8 concurrent
 - **Token billing differs by model:** per POPE call, 3.1 Flash-Lite billed ~1,120 prompt tokens and 2.5 Flash-Lite ~300, so 3.1 costs 9× as much on images. On video it's the reverse: 3.1 billed 3–4× fewer tokens per call.
 - Invalid replies (scored wrong): 2.5 Flash-Lite 31 of 8,196, 3.1 Flash-Lite 5. The whole Gemini run cost ≈ $5.
 
+### EVS in vLLM for Qwen3.5 (2026-11-17)
+Stock vLLM disables EVS for Qwen3.5: `--video-pruning-rate` crashes at startup in 0.32 and 0.34. A vLLM general plugin (not part of this repo) re-registers `Qwen3_5ForConditionalGeneration` as a subclass that turns vLLM's own EVS back on. It was written against vLLM 0.22/0.23. On vLLM 0.34.0 it needed one more line, calling the parent's `_init_video_pruning(mm_config)` so that `video_pruning_method` is set. Without pruning, it matches stock vLLM (within 0.002 accuracy).
+
+9B through vLLM 0.34.0's chat endpoint (`--scorers vllm-chat`, one request at a time, L40S), same seed-0 video samples as above:
+
+| dataset | no pruning | EVS q = 0.5 | EVS q = 0.75 |
+|---|---|---|---|
+| TempCompass MC | 0.814 · 1.72 s | 0.801 · 1.68 s · −44% tokens | 0.774 · 1.61 s · −66% tokens |
+| TempCompass yes/no | 0.802 · 1.41 s | 0.794 · 1.36 s · −45% tokens | 0.771 · 1.27 s · −67% tokens |
+| NExT-QA | 0.838 · 4.00 s | 0.834 · 3.81 s · −45% tokens | 0.823 · 3.76 s · −68% tokens |
+
+Cells: accuracy · s/request · change in billed prompt tokens versus no pruning.
+
+- **Pruning cuts prompt tokens as specified** (−44 to −45% at q = 0.5, −66 to −68% at q = 0.75; text tokens are not pruned) and **costs accuracy like the fork's EVS:** −0.004 to −0.013 at q = 0.5 and −0.015 to −0.040 at q = 0.75. Our fork lost ≤ 0.016 at q = 0.5 and 0.02–0.04 at q = 0.75.
+- **It barely saves time (2–10%).** Pruning runs after the vision tower, and the chat endpoint is one call per question, so each call decodes and encodes the clip again. Those steps, not the language-model prefill, dominate a request. EVS pays off where prefill dominates: long clips, many concurrent requests, or a fork that encodes each clip once.
+- **q = 0.5 is the sensible setting** in both systems: about half the video tokens for about 0.01 accuracy.
+
 ### Single-pass path for one-question requests (2026-11-14)
 A request with one branch now runs `state + branch` as one left-padded forward (`fork.forward_sequences`), reading the weights once instead of twice (prefill, then the branch). Requests with 2+ branches still fork, and mixed batches split between the two paths. It's on by default (`Backbone.single_pass`); `zero_shot_eval.py --no-single-pass` turns it off. Reads match the fork to < 1e-4 (tiny model; an off-by-one slice fails 4 tests).
 
@@ -381,7 +398,7 @@ M1 design notes:
 - [x] M5: images and short videos in the state, EVS pruning; POPE 0.91, TempCompass 0.75–0.78, NExT-QA 0.82 (9B zero-shot)
 - [x] M5 follow-ups: full MMStar, video sets retimed with the decode fix, vLLM media baseline via chat completions
 - [x] Qwen vs Gemini (Decision 1, 2.5 / 3.1 Flash-Lite) on the image and video sets: Decision 1 is the best accuracy per dollar on video
-- [ ] M5: chat-format prompt in the fork (vLLM leads on video by 0.02–0.06), image-blind / frame-shuffle stress tests, vLLM EVS once it supports Qwen3.5
+- [ ] M5: chat-format prompt in the fork (vLLM leads on video by 0.02–0.06), image-blind / frame-shuffle stress tests, vLLM EVS measured via a plugin (−45% tokens at q = 0.5 for ≈ −0.01 accuracy)
 - [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
 - [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
 - [ ] bf16 inference speed for the local scorers (eval runs used fp32 for 0.8B); fused MoE kernels for 35B-A3B
