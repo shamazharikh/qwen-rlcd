@@ -11,7 +11,9 @@ in `usage` for cost per call.
 
 Requests with media send them as content parts ahead of the text (`image_url` / `video_url`, as vLLM's
 OpenAI server accepts), so the same scorer is the vLLM image/video baseline: `--scorers vllm-chat` points it at
-a local vLLM server, with thinking off (`chat_template_kwargs`) and one answer token.
+a local vLLM server, with thinking off (`chat_template_kwargs`) and one answer token. Gemini's OpenAI-compatible
+endpoint takes no video, so for Gemini models a request with media goes to the native `generateContent` API
+instead, with images and videos inline and thinking off.
 """
 
 from __future__ import annotations
@@ -76,7 +78,7 @@ class ChatCompletionScorer:
         logprobs: bool = True,
         max_tokens: int = 16,
         retries: int = 6,
-        timeout: float = 60,
+        timeout: float = 180,
         extra_body: dict | None = None,
         top_logprobs: int = 10,
     ):
@@ -93,8 +95,36 @@ class ChatCompletionScorer:
     def predict(self, request: Request | dict) -> dict:
         if isinstance(request, dict):
             request = Request.from_dict(request)
+        if request.has_media and "generativelanguage.googleapis.com" in self.url:
+            parts = _gemini_parts(request, self.api_key)
+            return {qid: self._ask_gemini_native(request.state, q, parts) for qid, q in request.questions.items()}
         media = _media_parts(request)
         return {qid: self._ask(request.state, q, media) for qid, q in request.questions.items()}
+
+    def _ask_gemini_native(self, state: str, q: Question, media_parts: list):
+        """Gemini `generateContent` with inline media (hard answers: no logprobs requested)."""
+        text, labels = render(state, q)
+        body = {
+            "systemInstruction": {"parts": [{"text": SYSTEM}]},
+            "contents": [{"role": "user", "parts": [*media_parts, {"text": text}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": self.max_tokens, "thinkingConfig": {"thinkingBudget": 0}},
+        }
+        base = self.url.rsplit("/openai/", 1)[0]
+        data = self._post(body, url=f"{base}/models/{self.model}:generateContent", headers={"x-goog-api-key": self.api_key})
+        usage = data.get("usageMetadata") or {}
+        self.usage.update(prompt_tokens=usage.get("promptTokenCount", 0), completion_tokens=usage.get("candidatesTokenCount", 0)
+                          + usage.get("thoughtsTokenCount", 0), calls=1, hard_answers=1)  # fmt: skip
+        cand = (data.get("candidates") or [{}])[0]
+        reply = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts", []))
+        if cand.get("finishReason") not in (None, "STOP", "MAX_TOKENS"):
+            self.usage["blocked"] += 1
+        picked = parse(reply, labels)
+        if picked is None:
+            self.usage["invalid"] += 1
+            probs = [1.0 / len(labels)] * len(labels)
+        else:
+            probs = [1.0 if l == picked else 0.0 for l in labels]
+        return _typed(q, probs)
 
     def _ask(self, state: str, q: Question, media: list | None = None):
         text, labels = render(state, q)
@@ -131,12 +161,12 @@ class ChatCompletionScorer:
                 probs = [1.0 if l == picked else 0.0 for l in labels]
         return _typed(q, probs)
 
-    def _post(self, body: dict) -> dict:
+    def _post(self, body: dict, url: str | None = None, headers: dict | None = None) -> dict:
         payload = json.dumps(body)
+        headers = headers or {"Authorization": f"Bearer {self.api_key}"}
         for attempt in range(self.retries + 1):
             req = urllib.request.Request(
-                self.url, data=payload.encode(), method="POST",
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+                url or self.url, data=payload.encode(), method="POST", headers={"Content-Type": "application/json", **headers},
             )  # fmt: skip
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -164,6 +194,22 @@ def _media_parts(request: Request) -> list:
 
     parts = [{"type": "image_url", "image_url": {"url": _media_url(i, "image")}} for i in request.images]
     return parts + [{"type": "video_url", "video_url": {"url": _media_url(v, "video")}} for v in request.videos]
+
+
+def _gemini_parts(request: Request, api_key: str) -> list:
+    """Images inline; local videos uploaded once to the Files API and referenced by URI in every call."""
+    from system_one.gemini_files import upload
+    from system_one.remote import MIME, inline_media
+
+    parts = [{"inline_data": inline_media(i, "image")} for i in request.images]
+    for v in request.videos:
+        if isinstance(v, str) and not v.startswith(("data:", "http://", "https://")):
+            path = v[7:] if v.startswith("file://") else v
+            mime = MIME[os.path.splitext(path)[1].lower()]
+            parts.append({"file_data": {"file_uri": upload(path, mime, api_key), "mime_type": mime}})
+        else:
+            parts.append({"inline_data": inline_media(v, "video")})
+    return parts
 
 
 def _typed(q: Question, probs: list[float]):

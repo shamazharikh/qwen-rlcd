@@ -284,6 +284,35 @@ EVS in the fork (accuracy · s/request; q = 0.75 was timed before the decode fix
 - **No vLLM EVS comparison is possible yet:** `--video-pruning-rate` crashes at startup for Qwen3.5 in both vLLM 0.32 and nightly 0.34.0rc1 (`'Qwen3_5ForConditionalGeneration' object has no attribute 'video_pruning_method'`).
 - **MMStar now parses all 1,500 questions** (both option formats). The first run skipped the 23% in MathVista style and scored 0.700 on the rest.
 
+### Qwen vs Gemini on images and short videos (2026-11-17)
+Same 200 seed-0 requests per dataset for every column (`--examples-dir` cache: identical images and transcoded videos). Gemini Decision 1 gets each image or clip once with all its questions (input blocks; videos uploaded once to the Gemini Files API), 16 concurrent requests. Gemini 2.5 / 3.1 Flash-Lite answer one question per call through the native `generateContent` API, because their OpenAI-compatible endpoint takes no video. They run with thinking off, 16 concurrent requests, and return hard labels only. Gemini samples video frames itself at its default resolution; Qwen uses 2 fps, at most 32 frames. Accuracy (F1 for the yes/no sets in brackets):
+
+| dataset | Qwen 9B fork | vLLM 9B (chat) | Gemini Decision 1 | 2.5 Flash-Lite | 3.1 Flash-Lite |
+|---|---|---|---|---|---|
+| POPE | **0.908** (0.906) | 0.893 (0.884) | 0.882 (0.871) | 0.887 (0.882) | 0.896 (0.889) |
+| MMStar | 0.735 | 0.725 | **0.775** | 0.595 | 0.690 |
+| TempCompass MC + caption matching | 0.777 | 0.816 | 0.854 | 0.752 | **0.858** |
+| TempCompass yes/no | 0.746 (0.777) | 0.804 (0.800) | 0.835 (0.817) | 0.751 (0.746) | **0.847** (0.843) |
+| NExT-QA (clips ≤ 60 s) | 0.823 | 0.839 | 0.848 | 0.786 | **0.850** |
+| probabilities (ECE-15) | yes (0.02–0.08) | yes (0.03–0.10) | yes (0.05–0.09) | no | no |
+
+$ per 1M requests (self-hosted: L40S $1.861/h × wall time; vLLM at 8 concurrent; APIs: billed tokens × list price) and seconds per request:
+
+| dataset | Qwen 9B fork | vLLM 9B | Decision 1 | 2.5 Flash-Lite | 3.1 Flash-Lite |
+|---|---|---|---|---|---|
+| POPE (18 Q) | **$109** · 0.21 s | $284 · 0.55 s | $198 · 0.14 s | $551 · 2.4 s | $5,083 · 2.2 s |
+| MMStar (1 Q) | $49 · 0.10 s | **$20** · 0.04 s | $121 · 0.19 s | $35 · 0.11 s | $294 · 0.13 s |
+| TempCompass MC (7.6 Q) | $228 · 0.44 s | $468 · 0.91 s | **$140** · 0.10 s | $2,488 · 1.2 s | $1,661 · 0.85 s |
+| TempCompass yes/no (6.3 Q) | $214 · 0.41 s | $385 · 0.75 s | **$122** · 0.09 s | $2,032 · 1.1 s | $1,324 · 0.70 s |
+| NExT-QA (8.2 Q) | $388 · 0.75 s | $1,191 · 2.30 s | **$273** · 0.18 s | $6,258 · 1.9 s | $3,960 · 0.98 s |
+
+- **Gemini Decision 1 is the best accuracy per dollar on video:** 0.03–0.09 more accurate than the Qwen 9B fork and 30–40% cheaper than the fork on an on-demand L40S, with calibrated probabilities. It reads each clip once for all its questions, as the fork does.
+- **3.1 Flash-Lite is the most accurate on video** (0.85–0.86), tied with Decision 1, but costs 10–15× as much: one call per question re-bills the clip's tokens every time. It returns no probabilities.
+- **The Qwen 9B fork leads on POPE** (0.908, the cheapest at $109) and is the fastest self-hosted option on every multi-question set. On video it trails Decision 1, 3.1 Flash-Lite and vLLM (whose chat prompt suits video better).
+- **2.5 Flash-Lite is the weakest** on MMStar (0.595) and video (0.75–0.79), and expensive on video.
+- **Token billing differs by model:** per POPE call, 3.1 Flash-Lite billed ~1,120 prompt tokens and 2.5 Flash-Lite ~300, so 3.1 costs 9× as much on images. On video it's the reverse: 3.1 billed 3–4× fewer tokens per call.
+- Invalid replies (scored wrong): 2.5 Flash-Lite 31 of 8,196, 3.1 Flash-Lite 5. The whole Gemini run cost ≈ $5.
+
 ### Single-pass path for one-question requests (2026-11-14)
 A request with one branch now runs `state + branch` as one left-padded forward (`fork.forward_sequences`), reading the weights once instead of twice (prefill, then the branch). Requests with 2+ branches still fork, and mixed batches split between the two paths. It's on by default (`Backbone.single_pass`); `zero_shot_eval.py --no-single-pass` turns it off. Reads match the fork to < 1e-4 (tiny model; an off-by-one slice fails 4 tests).
 
@@ -351,6 +380,7 @@ M1 design notes:
 - [ ] Latency vs #questions at 512–32k-token states (README §7.8)
 - [x] M5: images and short videos in the state, EVS pruning; POPE 0.91, TempCompass 0.75–0.78, NExT-QA 0.82 (9B zero-shot)
 - [x] M5 follow-ups: full MMStar, video sets retimed with the decode fix, vLLM media baseline via chat completions
+- [x] Qwen vs Gemini (Decision 1, 2.5 / 3.1 Flash-Lite) on the image and video sets: Decision 1 is the best accuracy per dollar on video
 - [ ] M5: chat-format prompt in the fork (vLLM leads on video by 0.02–0.06), image-blind / frame-shuffle stress tests, vLLM EVS once it supports Qwen3.5
 - [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
 - [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias

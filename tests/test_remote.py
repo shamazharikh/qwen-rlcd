@@ -128,3 +128,41 @@ def test_chat_scorer_sends_media_and_reads_letter_logprobs(monkeypatch):
     assert parts[1]["video_url"]["url"] == "file:///tmp/v.mp4"
     assert sent["chat_template_kwargs"] == {"enable_thinking": False} and sent["max_tokens"] == 1
     assert ans.choice == "b" and ans.probabilities["b"] > 0.9
+
+
+def test_gemini_decisions_body_inlines_media(tmp_path):
+    from PIL import Image
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"\x00\x01")
+    req = Request.from_dict({"state": "Look.", "images": [Image.new("RGB", (4, 4))], "videos": [str(video)],
+                             "questions": {"q": {"type": "noul", "instructions": "Is it red?"}}})  # fmt: skip
+    body = GeminiDecisions(api_key="k", resolution="low", files_api=False).body(req)
+    text, image, vid = body["input"]
+    assert text == {"type": "text", "text": "Look."}
+    assert image["type"] == "image" and image["mime_type"] == "image/png" and image["resolution"] == "low"
+    assert vid == {"type": "video", "data": "AAE=", "mime_type": "video/mp4", "resolution": "low"}
+
+
+def test_gemini_chat_uses_native_api_for_media(monkeypatch, tmp_path):
+    from system_one.chat import ChatCompletionScorer
+
+    calls = []
+
+    def fake_post(self, body, url=None, headers=None):
+        calls.append((url, body))
+        return {"candidates": [{"content": {"parts": [{"text": "yes"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 300, "candidatesTokenCount": 1}}  # fmt: skip
+
+    monkeypatch.setattr(ChatCompletionScorer, "_post", fake_post)
+    monkeypatch.setattr("system_one.gemini_files.upload", lambda path, mime, key: "https://files/abc")
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"\x00")
+    scorer = ChatCompletionScorer("gemini-2.5-flash-lite", api_key="k")
+    req = Request.from_dict({"state": "Watch.", "videos": [str(video)], "questions": {"q": {"type": "noul", "instructions": "Fire?"}}})
+    ans = scorer.predict(req)["q"]
+    url, body = calls[0]
+    assert url.endswith("/v1beta/models/gemini-2.5-flash-lite:generateContent")
+    assert body["contents"][0]["parts"][0] == {"file_data": {"file_uri": "https://files/abc", "mime_type": "video/mp4"}}
+    assert body["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    assert ans.noul == 1.0 and scorer.usage["prompt_tokens"] == 300
