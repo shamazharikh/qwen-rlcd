@@ -36,6 +36,7 @@ class Backbone:
     media: MediaConfig = field(default_factory=MediaConfig)
     _runner: object = field(default=None, init=False, repr=False)
     last_media_stats: dict = field(default_factory=dict, init=False, repr=False)
+    media_totals: dict = field(default_factory=dict, init=False, repr=False)  # summed media stats across requests
 
     @classmethod
     def from_pretrained(
@@ -116,7 +117,10 @@ class Backbone:
             raise ValueError("request has images/videos: load the backbone with vision=True")
         state = multimodal.encode_state(self.vlm, self.processor, state_text, images, videos, self.media)
         self.last_media_stats = {"state_tokens": state.embeds.shape[1], "vision_tokens": state.vision_tokens,
-                                 "pruned_tokens": state.pruned_tokens}  # fmt: skip
+                                 "pruned_tokens": state.pruned_tokens, "vision_seconds": state.vision_seconds}  # fmt: skip
+        for k, v in self.last_media_stats.items():
+            self.media_totals[k] = self.media_totals.get(k, 0) + v
+        self.media_totals["requests"] = self.media_totals.get("requests", 0) + 1
         if self.single_pass and len(branches) == 1:
             return [multimodal.forward_with_branch(self.text_model, state, branches[0])]
         cache = multimodal.prefill(self.text_model, state)

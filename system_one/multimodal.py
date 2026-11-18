@@ -11,6 +11,14 @@ same patch in the previous temporal group: rank by 1 - cosine similarity of the 
 keep the first group, keep `max(tokens_per_group, int(total * (1 - q)))` tokens. Retained tokens keep their
 unpruned M-RoPE positions and the text after the video keeps its own, as in vLLM.
 
+Pixel pruning (`video_pruning_method="pixel"`) drops video patches *before* the vision tower. It works per
+merged cell (2x2 patches x 2 frames, one LM token): cells are ranked by mean absolute change of their normalized
+pixels from the same cell in the previous temporal group, with EVS's keep budget, and the tower runs only on the
+kept cells. This is possible without patching transformers because the Qwen3.5 vision forward computes patch
+embeddings, interpolated position embeddings and 2D rotary positions per patch, and attends only within a
+temporal group (`cu_seqlens`); all three are overridable through its kwargs. Kept cells see only the kept cells of
+their own group, so their features differ from an unpruned pass (dropping whole groups is exact).
+
 The state must be prefilled with 3-axis positions: a 2D or 4-axis text position track that jumps would be read
 by transformers as packed sequences and split the attention.
 """
@@ -34,7 +42,9 @@ VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
 class MediaConfig:
     """Bounds on vision tokens. Images: at most `image_max_pixels` (~1 token per 32x32 px after merging).
     Videos: `fps` frames per second, `min_frames`..`max_frames` (2 frames make one temporal group), each frame
-    resized to at most `video_max_side` px on its longer side. `video_pruning_rate`: EVS q in [0, 1)."""
+    resized to at most `video_max_side` px on its longer side. `video_pruning_rate`: fraction q in [0, 1) of video
+    tokens to drop; `video_pruning_method`: "evs" (after the vision tower, by feature change) or "pixel" (before
+    it, by pixel change, so the tower also skips the dropped patches)."""
 
     image_max_pixels: int = 1024 * 1024
     fps: float = 2.0
@@ -42,6 +52,7 @@ class MediaConfig:
     max_frames: int = 32
     video_max_side: int = 448
     video_pruning_rate: float = 0.0
+    video_pruning_method: str = "evs"
 
 
 @dataclass
@@ -52,6 +63,7 @@ class MultimodalState:
     input_ids: torch.Tensor  # [1, S] (pruned video tokens removed)
     vision_tokens: int  # image + video tokens kept
     pruned_tokens: int
+    vision_seconds: float = 0.0  # vision tower (and pruning) wall time for this state
 
 
 # ---- loading ---------------------------------------------------------------------------------------------
@@ -138,6 +150,46 @@ def evs_retention_mask(features: torch.Tensor, grid_thw, merge_size: int, q: flo
     return keep
 
 
+def pixel_retention_mask(pixel_values: torch.Tensor, grid_thw, merge_size: int, q: float) -> torch.Tensor:
+    """Boolean mask over one video's merged cells ([T*h*w] with h, w the merged grid) from its processor patches
+    (`pixel_values`: [T*H*W, C*t*p*p], block-major so each merged cell is `merge_size**2` consecutive rows).
+    Ranks cells by mean absolute pixel change from the same cell in the previous temporal group; keeps the first
+    group and EVS's budget."""
+    t, h, w = (int(x) for x in grid_thw)
+    unit = merge_size * merge_size
+    cells = pixel_values.float().reshape(t, (h // merge_size) * (w // merge_size), unit * pixel_values.shape[-1])
+    change = (cells[1:] - cells[:-1]).abs().mean(-1)  # [t-1, cells]
+    change = torch.cat([torch.full_like(cells[:1, :, 0], float("inf")), change]).flatten()
+    keep = torch.zeros_like(change, dtype=torch.bool)
+    keep[torch.argsort(change, descending=True, stable=True)[: evs_keep_count(cells.shape[1], t, q)]] = True
+    return keep
+
+
+def vision_forward_cells(visual, pixel_values: torch.Tensor, grid_thw, keep_cells: torch.Tensor) -> torch.Tensor:
+    """Run the vision tower on the kept merged cells of one video only. Returns [keep_cells.sum(), d] merged
+    features in cell order. Per-patch inputs (patch rows, position-embedding interpolation, rotary positions) are
+    computed for the full grid and subset; attention segments shrink to each group's kept patches."""
+    from transformers.vision_utils import get_vision_interpolation_indices_and_weights, get_vision_position_ids
+
+    grid = torch.as_tensor(grid_thw, device=pixel_values.device).view(1, 3)
+    t = int(grid[0, 0])
+    unit = visual.spatial_merge_size**2
+    keep_patches = keep_cells.repeat_interleave(unit)
+    interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+        grid, num_grid_per_side=visual.num_grid_per_side, mode=visual.interpolation_mode,
+        align_corners=visual.interpolation_align_corners, spatial_merge_size=visual.spatial_merge_size,
+    )  # fmt: skip
+    position_ids = get_vision_position_ids(grid, visual.spatial_merge_size)
+    per_group = keep_cells.view(t, -1).sum(1) * unit
+    per_group = per_group[per_group > 0]
+    cu_seqlens = torch.nn.functional.pad(per_group.cumsum(0, dtype=torch.int32), (1, 0))
+    out = visual(
+        pixel_values[keep_patches], grid_thw=grid, cu_seqlens=cu_seqlens, position_ids=position_ids[keep_patches],
+        interp_indices=interp_indices[keep_patches], interp_weights=interp_weights[keep_patches], return_dict=True,
+    )  # fmt: skip
+    return out.pooler_output
+
+
 # ---- state encoding --------------------------------------------------------------------------------------
 
 
@@ -170,6 +222,11 @@ def encode_state(vlm, processor, state_text: str, images=(), videos=(), cfg: Med
     merge = vlm.visual.spatial_merge_size
     keep = torch.ones(input_ids.shape[1], dtype=torch.bool, device=device)
     vision_tokens = pruned = 0
+    import time
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
 
     if imgs:
         feats = vlm.get_image_features(enc["pixel_values"].to(device), enc["image_grid_thw"].to(device)).pooler_output
@@ -179,20 +236,35 @@ def encode_state(vlm, processor, state_text: str, images=(), videos=(), cfg: Med
         vision_tokens += len(slots)
     if vids:
         grids = enc["video_grid_thw"].to(device)
-        per_video = vlm.get_video_features(enc["pixel_values_videos"].to(device), grids).pooler_output
+        pixels = enc["pixel_values_videos"].to(device)
         slots = (input_ids[0] == cfg_vlm.video_token_id).nonzero().squeeze(1)
-        masks = []
-        for feats, grid in zip(per_video, grids):
-            if cfg.video_pruning_rate > 0:
-                masks.append(evs_retention_mask(feats, grid, merge, cfg.video_pruning_rate))
-            else:
-                masks.append(torch.ones(len(feats), dtype=torch.bool, device=device))
-        embeds[0, slots] = torch.cat(per_video).to(embeds.dtype)
+        q, method = cfg.video_pruning_rate, cfg.video_pruning_method
+        if method not in ("evs", "pixel"):
+            raise ValueError(f"video_pruning_method must be 'evs' or 'pixel', got {method!r}")
+        masks, feats_kept = [], []
+        if q > 0 and method == "pixel":  # prune before the tower: it only encodes the kept cells
+            offset = 0
+            for grid in grids:
+                n = int(grid.prod())
+                mask = pixel_retention_mask(pixels[offset : offset + n], grid, merge, q)
+                feats_kept.append(vision_forward_cells(vlm.visual, pixels[offset : offset + n], grid, mask))
+                masks.append(mask)
+                offset += n
+        else:
+            per_video = vlm.get_video_features(pixels, grids).pooler_output
+            for feats, grid in zip(per_video, grids):
+                mask = evs_retention_mask(feats, grid, merge, q) if q > 0 else torch.ones(len(feats), dtype=torch.bool, device=device)
+                masks.append(mask)
+                feats_kept.append(feats[mask])
         video_keep = torch.cat(masks)
+        embeds[0, slots[video_keep]] = torch.cat(feats_kept).to(embeds.dtype)
         keep[slots] = video_keep
         vision_tokens += int(video_keep.sum())
         pruned = int((~video_keep).sum())
 
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    vision_seconds = time.perf_counter() - t0
     position_ids, _ = vlm.get_rope_index(
         input_ids, enc["mm_token_type_ids"].to(device),
         image_grid_thw=enc.get("image_grid_thw", None), video_grid_thw=enc.get("video_grid_thw", None),
@@ -200,7 +272,7 @@ def encode_state(vlm, processor, state_text: str, images=(), videos=(), cfg: Med
     next_position = int(position_ids.max()) + 1
     return MultimodalState(
         embeds=embeds[:, keep], position_ids=position_ids[:, :, keep], next_position=next_position,
-        input_ids=input_ids[:, keep], vision_tokens=vision_tokens, pruned_tokens=pruned,
+        input_ids=input_ids[:, keep], vision_tokens=vision_tokens, pruned_tokens=pruned, vision_seconds=vision_seconds,
     )  # fmt: skip
 
 
