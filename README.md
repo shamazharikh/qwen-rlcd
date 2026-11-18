@@ -313,6 +313,23 @@ $ per 1M requests (self-hosted: L40S $1.861/h × wall time; vLLM at 8 concurrent
 - **Token billing differs by model:** per POPE call, 3.1 Flash-Lite billed ~1,120 prompt tokens and 2.5 Flash-Lite ~300, so 3.1 costs 9× as much on images. On video it's the reverse: 3.1 billed 3–4× fewer tokens per call.
 - Invalid replies (scored wrong): 2.5 Flash-Lite 31 of 8,196, 3.1 Flash-Lite 5. The whole Gemini run cost ≈ $5.
 
+### Pruning video patches before the vision tower (2026-11-18)
+EVS (in vLLM and in the fork) scores tokens on vision-tower features, so the tower still encodes every patch. `--video-pruning-method pixel` prunes before the tower instead. Each merged cell (2×2 patches × 2 frames, one LM token) is ranked by the mean absolute change of its normalized pixels from the same cell in the previous temporal group, with EVS's budget (the whole first group, then the top `1 − q` overall). The tower then encodes only the kept cells. Transformers needs no patch: the Qwen3.5 vision forward takes per-patch position embeddings, rotary positions and per-group attention segments (`cu_seqlens`) through its kwargs (`multimodal.vision_forward_cells`). Kept tokens keep their unpruned M-RoPE positions.
+
+Tests: keeping every cell equals the stock forward, and dropping whole temporal groups leaves the others bit-identical (attention is per group). Pruning inside a group does change the kept features (they lose context), the pixel mask keeps moving cells within the budget, and positions and reads are checked.
+
+9B `letter` fork, L40S, same seed-0 video samples. Cells: accuracy · s/request · vision-tower ms/request:
+
+| dataset | no pruning | EVS q = 0.5 | pixel q = 0.5 | EVS q = 0.75 | pixel q = 0.75 |
+|---|---|---|---|---|---|
+| TempCompass MC | 0.778 · 0.44 · 62 | 0.771 · 0.37 · 63 | 0.762 · **0.34** · **43** | 0.735 · 0.35 · 63 | 0.717 · 0.32 · 35 |
+| TempCompass yes/no | 0.744 · 0.42 · 63 | 0.760 · 0.37 · 64 | 0.754 · **0.33** · **43** | 0.728 · 0.35 · 64 | 0.716 · 0.31 · 35 |
+| NExT-QA | 0.823 · 0.78 · 98 | 0.805 · 0.66 · 99 | 0.810 · **0.61** · **60** | 0.801 · 0.62 · 99 | 0.771 · 0.55 · 44 |
+
+- **At q = 0.5, pixel pruning matches EVS on accuracy (±0.01) and is 7–10% faster end to end:** the vision tower runs 32–39% faster because it encodes half the patches, while EVS leaves the tower cost unchanged.
+- **At q = 0.75, pixel pruning costs 0.012–0.030 more accuracy than EVS.** Kept cells lose more context inside the tower, and pixel change is a cruder signal than feature change. It is also as fast as pixel q = 0.5, which is more accurate.
+- **The vision tower is only 13–15% of a video request** (62–98 ms of 0.42–0.78 s); decoding, the ~1.2–1.9k-token prefill and the questions take the rest. So pruning before the tower can save at most about half of that slice. Pixel q = 0.5 is the best trade-off measured here: 20–24% faster than no pruning at ≤ 0.016 accuracy cost.
+
 ### Single-pass path for one-question requests (2026-11-14)
 A request with one branch now runs `state + branch` as one left-padded forward (`fork.forward_sequences`), reading the weights once instead of twice (prefill, then the branch). Requests with 2+ branches still fork, and mixed batches split between the two paths. It's on by default (`Backbone.single_pass`); `zero_shot_eval.py --no-single-pass` turns it off. Reads match the fork to < 1e-4 (tiny model; an off-by-one slice fails 4 tests).
 
@@ -381,6 +398,7 @@ M1 design notes:
 - [x] M5: images and short videos in the state, EVS pruning; POPE 0.91, TempCompass 0.75–0.78, NExT-QA 0.82 (9B zero-shot)
 - [x] M5 follow-ups: full MMStar, video sets retimed with the decode fix, vLLM media baseline via chat completions
 - [x] Qwen vs Gemini (Decision 1, 2.5 / 3.1 Flash-Lite) on the image and video sets: Decision 1 is the best accuracy per dollar on video
+- [x] Patch pruning before the vision tower (`--video-pruning-method pixel`): at q = 0.5, same accuracy as EVS, 7–10% faster
 - [ ] M5: chat-format prompt in the fork (vLLM leads on video by 0.02–0.06), image-blind / frame-shuffle stress tests, vLLM EVS once it supports Qwen3.5
 - [x] M3 calibration: temperature per type/K-bucket, Platt for yes/no, F1-tuned thresholds (GoEmotions F1 0.12 → 0.26)
 - [ ] Per-task calibration in the serving API (a `calibration` field per request or task); trained `noul` heads (M2) to remove the task-dependent yes-bias
