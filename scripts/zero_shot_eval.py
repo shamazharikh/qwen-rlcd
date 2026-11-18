@@ -424,6 +424,7 @@ def main():
     parser.add_argument("--examples-dir", help="cache the sampled requests (and their videos) here, or load them if present")
     parser.add_argument("--gemini-media-resolution", default=None, choices=["low", "medium", "high"], help="gemini: media resolution (default: API default)")
     parser.add_argument("--video-pruning-rate", type=float, default=0.0, help="local scorers: EVS q in [0, 1) for video tokens")
+    parser.add_argument("--video-pruning-method", default="evs", choices=["evs", "pixel"], help="evs: after the vision tower (feature change); pixel: before it (pixel change)")
     parser.add_argument("--video-fps", type=float, default=2.0, help="video frames sampled per second (max --video-max-frames)")
     parser.add_argument("--video-max-frames", type=int, default=32)
     parser.add_argument("--chunk-size", type=int, default=None, help="local scorers: max branch rows per forward (default 32)")
@@ -444,6 +445,7 @@ def main():
         backbone.cuda_graphs = args.cuda_graphs
         backbone.single_pass = not args.no_single_pass
         backbone.media.video_pruning_rate = args.video_pruning_rate
+        backbone.media.video_pruning_method = args.video_pruning_method
         backbone.media.fps, backbone.media.max_frames = args.video_fps, args.video_max_frames
         backbone.media.image_max_pixels, backbone.media.video_max_side = IMAGE_MAX_PIXELS, VIDEO_MAX_SIDE
     scorers = {
@@ -477,7 +479,16 @@ def main():
                 )  # fmt: skip
             else:
                 scorer = scorers[scorer_name]()
+            if backbone:
+                backbone.media_totals = {}
             m = evaluate(examples, scorer, workers, args.batch_requests)
+            if backbone and backbone.media_totals.get("requests"):  # media sets: vision tower time and tokens kept
+                tot = backbone.media_totals
+                m["vision_s_per_request"] = tot["vision_seconds"] / tot["requests"]
+                m["vision_tokens_per_request"] = tot["vision_tokens"] / tot["requests"]
+                m["pruned_tokens_per_request"] = tot["pruned_tokens"] / tot["requests"]
+                print(f"  {name}: vision {1000 * m['vision_s_per_request']:.0f} ms/request, "
+                      f"{m['vision_tokens_per_request']:.0f} video+image tokens kept, {m['pruned_tokens_per_request']:.0f} pruned", flush=True)
             preds = m.pop("_preds")
             if args.dump_preds:
                 dumps.setdefault(name, {})[scorer_name] = preds

@@ -202,3 +202,77 @@ def test_evs_reads_run_and_differ_from_unpruned(backbone):
     assert stats["pruned_tokens"] > 0
     for f, p in zip(full, pruned):
         assert f.shape == p.shape and torch.isfinite(p).all()
+
+
+# ---- pixel pruning (before the vision tower) ------------------------------------------------------------------
+
+
+def _video_pixels(backbone, video, cfg=MediaConfig()):
+    frames, meta = multimodal.load_video(video, cfg)
+    enc = backbone.processor(text=["<|vision_start|><|video_pad|><|vision_end|>"], videos=[frames],
+                             videos_kwargs={"video_metadata": [meta], "do_sample_frames": False}, return_tensors="pt")  # fmt: skip
+    return enc["pixel_values_videos"].to(DEVICE), enc["video_grid_thw"][0].to(DEVICE)
+
+
+def test_vision_forward_cells_keeping_everything_matches_stock_forward(backbone):
+    pixels, grid = _video_pixels(backbone, _video(10, frames=8))
+    full = backbone.vlm.visual(pixels, grid_thw=grid[None], return_dict=True).pooler_output
+    keep = torch.ones(full.shape[0], dtype=torch.bool, device=DEVICE)
+    with torch.no_grad():
+        got = multimodal.vision_forward_cells(backbone.vlm.visual, pixels, grid, keep)
+    assert (got - full).abs().max().item() < 1e-5
+
+
+def test_dropping_whole_groups_is_exact(backbone):
+    """Attention is per temporal group, so the cells of untouched groups must not change at all."""
+    pixels, grid = _video_pixels(backbone, _video(11, frames=8))
+    with torch.no_grad():
+        full = backbone.vlm.visual(pixels, grid_thw=grid[None], return_dict=True).pooler_output
+        t = int(grid[0])
+        per_group = full.shape[0] // t
+        keep = torch.ones(t, per_group, dtype=torch.bool, device=DEVICE)
+        keep[1] = False  # drop group 1 entirely
+        keep = keep.flatten()
+        got = multimodal.vision_forward_cells(backbone.vlm.visual, pixels, grid, keep)
+    assert (got - full[keep]).abs().max().item() < 1e-5
+
+
+def test_pruning_inside_a_group_changes_kept_features(backbone):
+    """Sanity: kept cells lose context from dropped cells of the same group (so the exact test isn't vacuous)."""
+    pixels, grid = _video_pixels(backbone, _video(12, frames=8))
+    with torch.no_grad():
+        full = backbone.vlm.visual(pixels, grid_thw=grid[None], return_dict=True).pooler_output
+        keep = torch.ones(full.shape[0], dtype=torch.bool, device=DEVICE)
+        keep[1::2] = False
+        got = multimodal.vision_forward_cells(backbone.vlm.visual, pixels, grid, keep)
+    assert (got - full[keep]).abs().max().item() > 1e-4
+
+
+def test_pixel_mask_keeps_moving_cells_and_budget(backbone):
+    pixels, grid = _video_pixels(backbone, _video(13, frames=8, static=True))
+    t, cells = int(grid[0]), int(grid[1] * grid[2]) // 4
+    keep = multimodal.pixel_retention_mask(pixels, grid, 2, q=0.5)
+    assert keep.sum().item() == evs_keep_count(cells, t, 0.5)
+    assert keep[:cells].all()  # first group
+    # A static clip with a moving square: every kept cell after the first group must have changed pixels.
+    c = pixels.float().reshape(t, cells, -1)
+    moved = torch.cat([torch.ones(cells, dtype=torch.bool, device=DEVICE), ((c[1:] - c[:-1]).abs().mean(-1) > 1e-6).flatten()])
+    assert (~keep | moved).all()
+
+
+def test_pixel_pruned_state_keeps_unpruned_positions_and_reads_run(backbone):
+    video = _video(14, frames=8, static=True)
+    full = encode_state(backbone.vlm, backbone.processor, "Clip.", videos=[video], cfg=MediaConfig())
+    pix = encode_state(backbone.vlm, backbone.processor, "Clip.", videos=[video],
+                       cfg=MediaConfig(video_pruning_rate=0.5, video_pruning_method="pixel"))  # fmt: skip
+    assert pix.pruned_tokens > 0 and pix.next_position == full.next_position
+    assert pix.embeds.shape[1] == full.embeds.shape[1] - pix.pruned_tokens
+    full_pos = {tuple(full.position_ids[:, 0, i].tolist()) + (int(full.input_ids[0, i]),) for i in range(full.embeds.shape[1])}
+    assert all(tuple(pix.position_ids[:, 0, i].tolist()) + (int(pix.input_ids[0, i]),) in full_pos for i in range(pix.embeds.shape[1]))
+    try:
+        backbone.media = MediaConfig(video_pruning_rate=0.5, video_pruning_method="pixel")
+        with torch.no_grad():
+            reads = backbone.run("Clip.", [backbone.encode(" Answer:"), backbone.encode(" Moving:")], ((), (video,)))
+    finally:
+        backbone.media = MediaConfig()
+    assert all(torch.isfinite(r).all() for r in reads)
